@@ -10,6 +10,7 @@ CONTEXT = {
     # 10: "'Blanket' should match 'Laundry type combined washing or drying machines' category as blanket is washed as laundry."
 }
 
+
 CONSTRAINTS = {
     1: "Do not provide any additional explanation beyond 'Yes,{Explanation of why item description matches any of the 3 categories}'(not more than 50 words) or 'No,{Explanation of why item description does not match all of the 3 categories}'(not more than 50 words)",
     2: "Always try to relate the item description to the any categories and only respond with No if it is impossible to relate it to all categories.",
