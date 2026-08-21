@@ -1,5 +1,6 @@
 from typing import Union, Tuple, List
 from pathlib import Path
+from openai import OpenAI, OpenAIError
 import configparser
 import json
 import os
@@ -30,6 +31,7 @@ LLM_CONFIG_ENV_OVERRIDES = {
 }
 
 _llm_config = None
+_llm_clients = {}
 
 
 def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: bool = False) -> configparser.ConfigParser:
@@ -49,10 +51,11 @@ def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: boo
 
     global _llm_config
     if _llm_config is None or reload:
-        parser = configparser.ConfigParser()
+        parser = configparser.ConfigParser(interpolation=None)
         if not parser.read(config_path, encoding="utf-8"):
             raise FileNotFoundError(f"LLM configuration file not found at '{config_path}'.")
         _llm_config = parser
+        _llm_clients.clear()  # rebuild the clients from the reloaded settings
     return _llm_config
 
 
@@ -82,44 +85,25 @@ def get_llm_config(section: str = "llm") -> dict:
     return settings
 
 
-def build_endpoint(settings: dict, path: str) -> str:
+def get_llm_client(section: str = "llm") -> OpenAI:
     """
-    Builds the URL of an OpenAI endpoint from the base URL of the given settings.
+    Returns a cached OpenAI client built from the settings of a section of llm.config.
 
     Args:
-        settings (dict): The settings of a section of llm.config.
-        path (str): The endpoint path, e.g. 'chat/completions'.
+        section (str, optional): The section to build the client from, either 'llm' or 'embedding'. Defaults to 'llm'.
 
     Returns:
-        str: The full URL of the endpoint.
-
-    Raises:
-        KeyError: If no base URL is configured.
+        client (OpenAI): A client pointed at the configured endpoint.
     """
 
-    base_url = settings.get("base_url")
-    if not base_url:
-        raise KeyError(f"No 'base_url' configured in '{LLM_CONFIG_PATH}'.")
-    return f"{base_url.rstrip('/')}/{path}"
-
-
-def build_headers(settings: dict) -> dict:
-    """
-    Builds the request headers of an OpenAI API call from the given settings.
-
-    Args:
-        settings (dict): The settings of a section of llm.config.
-
-    Returns:
-        headers (dict): The headers to send with the request.
-    """
-
-    headers = {"Content-Type": "application/json"}
-    if settings.get("api_key"):
-        headers["Authorization"] = f"Bearer {settings['api_key']}"
-    if settings.get("organization"):
-        headers["OpenAI-Organization"] = settings["organization"]
-    return headers
+    if section not in _llm_clients:
+        settings = get_llm_config(section)
+        client_arguments = {"api_key": settings.get("api_key") or "EMPTY"}  # self-hosted endpoints accept any key
+        for option, option_type in (("base_url", str), ("default_headers", json.loads), ("timeout", float), ("max_retries", int)):
+            if settings.get(option):
+                client_arguments[option] = option_type(settings[option])
+        _llm_clients[section] = OpenAI(**client_arguments)
+    return _llm_clients[section]
 
 
 def generate_system_prompt(role: str, task: str, context: str, constraints: str, definitions: str = None,
@@ -258,13 +242,14 @@ def api_chunk(base_url, strings, params):
         return None
 
 
-def api_embed(strings: List[str], model: str = None) -> List[List[float]]:
+def api_embed(strings: List[str], model: str = None, **parameters) -> List[List[float]]:
     """
-    Sends a request to the OpenAI-compatible embeddings endpoint to generate embeddings for a list of strings.
+    Generates embeddings for a list of strings with the embeddings endpoint of the OpenAI client.
 
     Args:
         strings (List[str]): The strings to generate embeddings for.
         model (str, optional): Overrides the model configured in the [embedding] section of llm.config.
+        **parameters: Additional embedding parameters (e.g. dimensions, encoding_format).
 
     Returns:
         List[List[float]]: The embedding vector of each string, in the same order as the strings provided.
@@ -272,59 +257,56 @@ def api_embed(strings: List[str], model: str = None) -> List[List[float]]:
     """
 
     settings = get_llm_config("embedding")
-    payload = {"model": model or settings["model"], "input": strings}
-    timeout = settings.get("timeout")
 
-    response = requests.post(build_endpoint(settings, 'embeddings'), json=payload,
-                             headers=build_headers(settings), timeout=float(timeout) if timeout else None)
-
-    if response.status_code == 200:
-        embeddings = sorted(response.json()["data"], key=lambda embedding: embedding["index"])
-        return [embedding["embedding"] for embedding in embeddings]
-    else:
-        print(f"Error: {response.status_code}, {response.text}")
+    try:
+        response = get_llm_client("embedding").embeddings.create(model=model or settings["model"], input=strings,
+                                                                 **parameters)
+    except OpenAIError as e:
+        print(f"Error: {e}")
         return None
+
+    embeddings = sorted(response.data, key=lambda embedding: embedding.index)
+    return [embedding.embedding for embedding in embeddings]
 
 
 def api_query(system_prompt: str, user_prompt: str, model: str = None, **parameters) -> str:
     """
-    Sends system and user prompts to the OpenAI-compatible chat completions endpoint and retrieves the generated response.
+    Sends system and user prompts to the responses endpoint of the OpenAI client and retrieves the generated response.
 
     Args:
         system_prompt (str): The system-level prompt providing context or instructions for the language model.
         user_prompt (str): The user-level prompt containing the main input or query for the language model.
         model (str, optional): Overrides the model configured in the [llm] section of llm.config.
-        **parameters: Additional chat completion parameters (e.g. temperature, max_tokens) that override llm.config.
+        **parameters: Additional response parameters (e.g. temperature, max_output_tokens) that override llm.config.
 
     Returns:
-        str: The message content generated by the language model if the request is successful.
+        str: The output text generated by the language model if the request is successful.
              Returns None if the request fails, and prints the error message.
     """
 
     settings = get_llm_config("llm")
-    payload = {
+    arguments = {
         "model": model or settings["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
+        "instructions": system_prompt,
+        "input": user_prompt
     }
 
-    for option, option_type in (("temperature", float), ("top_p", float), ("max_tokens", int), ("seed", int)):
+    if "max_tokens" in settings:  # the responses endpoint names the chat completions max_tokens max_output_tokens
+        settings.setdefault("max_output_tokens", settings.pop("max_tokens"))
+
+    for option, option_type in (("temperature", float), ("top_p", float), ("max_output_tokens", int)):
         value = parameters.pop(option, settings.get(option))
         if value is not None and value != "":
-            payload[option] = option_type(value)
-    payload.update(parameters)  # any other OpenAI parameter passed by the caller
+            arguments[option] = option_type(value)
+    arguments.update(parameters)  # any other OpenAI parameter passed by the caller
 
-    timeout = settings.get("timeout")
-    response = requests.post(build_endpoint(settings, 'chat/completions'), json=payload,
-                             headers=build_headers(settings), timeout=float(timeout) if timeout else None)
-
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        print(f"Error: {response.status_code}, {response.text}")
+    try:
+        response = get_llm_client("llm").responses.create(**arguments)
+    except OpenAIError as e:
+        print(f"Error: {e}")
         return None
+
+    return response.output_text
 
 
 def api_token_count(base_url, query):

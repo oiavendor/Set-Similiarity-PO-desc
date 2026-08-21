@@ -1,3 +1,4 @@
+openai>=1.66
 pandas[excel]
 requests
 tqdm
