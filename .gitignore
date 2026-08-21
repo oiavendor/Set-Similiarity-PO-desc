@@ -1,0 +1,6 @@
+/data
+/alert_gen
+/description_matching_old.py
+/venv
+/__pycache__
+/.mypy_cache

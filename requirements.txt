@@ -1,0 +1,5 @@
+pandas[excel]
+requests
+tqdm
+sqlalchemy
+pyodbc
