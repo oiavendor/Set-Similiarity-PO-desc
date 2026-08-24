@@ -464,35 +464,6 @@ def embed(strings: List[str], provider: str = None, model: str = None, **paramet
     return api_embed(strings, model=model, **parameters)
 
 
-def get_cluster_threshold(analysis_type: str, provider: str = None, model: str = None) -> float:
-    """
-    Returns the cosine distance threshold to cluster at, for the embedding model in force. Every model
-    has its own distance distribution, so a threshold calibrated for one model does not carry to another.
-
-    Args:
-        analysis_type (str): The analysis being run, either 'po' or 'payment'.
-        provider (str, optional): Overrides the provider configured in the [embedding] section.
-        model (str, optional): Overrides the model configured for that provider.
-
-    Returns:
-        float: The distance threshold below which two descriptions join the same cluster.
-
-    Raises:
-        KeyError: If no threshold is configured for that analysis type and model.
-    """
-
-    name = get_embedding_model_name(provider, model)
-    section = f"threshold.{analysis_type}"
-    value = get_llm_config(section).get(name.strip().lower())
-
-    if value is None:
-        raise KeyError(
-            f"No clustering threshold for embedding model '{name}' in section '[{section}]' of "
-            f"'{LLM_CONFIG_PATH}'. Add one and calibrate it before running with this model."
-        )
-    return float(value)
-
-
 def api_query(system_prompt: str, user_prompt: str, model: str = None, **parameters) -> str:
     """
     Sends system and user prompts to the responses endpoint of the OpenAI client and retrieves the generated response.

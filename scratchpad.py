@@ -15,14 +15,9 @@ from pathlib import Path
 import pandas
 
 from description_matching import description_matching
-from utils.GenAI import (api_query, embed, get_cluster_threshold, get_embedding_model_name,
+from utils.AnalysisConfig import get_analysis_config, get_cluster_threshold
+from utils.GenAI import (api_query, embed, get_embedding_model_name,
                          get_embedding_provider, get_llm_config)
-from utils.description_matching_enums import (
-    EXPLANATION_COLUMN,
-    PO_ITEM_DESC_COLUMN,
-    PO_SET_COLUMN,
-    PO_SPLIT_BOOLEAN_COLUMN,
-)
 
 INPUT_FILE = r"xxx"
 OUTPUT_FILE = r"xxx"
@@ -33,9 +28,15 @@ MODIFY_NUMBER = 50
 
 DEBUGMODE = True
 
-# Columns description_matching reads from the workbook, and the ones it writes back.
-REQUIRED_COLUMNS = [PO_SET_COLUMN, PO_ITEM_DESC_COLUMN]
-GENERATED_COLUMNS = [PO_SPLIT_BOOLEAN_COLUMN, EXPLANATION_COLUMN]
+# Columns description_matching reads from the workbook, and the ones it writes back. Both
+# come from the [analysis.<ANALYSIS_TYPE>] section of llm.config, so renaming a column there
+# is picked up here too.
+ANALYSIS = get_analysis_config(ANALYSIS_TYPE)
+GROUP_COLUMN = ANALYSIS["group_column"]
+DESCRIPTION_COLUMN = ANALYSIS["description_column"]
+BOOLEAN_COLUMN = ANALYSIS["boolean_column"]
+REQUIRED_COLUMNS = [GROUP_COLUMN, DESCRIPTION_COLUMN]
+GENERATED_COLUMNS = [BOOLEAN_COLUMN, ANALYSIS["explanation_column"]]
 
 
 def debug(message: str) -> None:
@@ -111,7 +112,7 @@ def test_embedding_connection() -> bool:
     else:
         describe_section("embedding")
 
-    threshold = get_cluster_threshold(ANALYSIS_TYPE, provider, model)
+    threshold = get_cluster_threshold(ANALYSIS_TYPE, model)
     print(f"  Clustering threshold for '{model}' / '{ANALYSIS_TYPE}': {threshold}")
 
     embeddings = embed(["connectivity probe", "connectivity probe"])
@@ -155,15 +156,15 @@ def check_columns(df: pandas.DataFrame) -> bool:
         null_count = df[column].isnull().sum()
         if null_count:
             print(f"  Warning: '{column}' has {null_count} empty value(s); "
-                  f"rows with an empty '{PO_SET_COLUMN}' are dropped by the grouping.")
+                  f"rows with an empty '{GROUP_COLUMN}' are dropped by the grouping.")
 
     debug(f"dtypes:\n{df.dtypes.to_string()}")
 
-    group_sizes = df.groupby(PO_SET_COLUMN).size()
-    debug(f"rows per '{PO_SET_COLUMN}':\n{group_sizes.to_string()}")
+    group_sizes = df.groupby(GROUP_COLUMN).size()
+    debug(f"rows per '{GROUP_COLUMN}':\n{group_sizes.to_string()}")
     singletons = int((group_sizes == 1).sum())
     if singletons:
-        print(f"  Warning: {singletons} of {len(group_sizes)} '{PO_SET_COLUMN}' group(s) hold a single row; "
+        print(f"  Warning: {singletons} of {len(group_sizes)} '{GROUP_COLUMN}' group(s) hold a single row; "
               f"clustering needs at least two rows per group and will raise on those.")
 
     return True
@@ -198,8 +199,8 @@ def test_description_matching() -> bool:
 
     debug(f"output frame:\n{df.head(10).to_string()}")
 
-    matched = int(df[PO_SPLIT_BOOLEAN_COLUMN].notnull().sum())
-    print(f"  {matched} of {len(df)} row(s) hold a '{PO_SPLIT_BOOLEAN_COLUMN}' value")
+    matched = int(df[BOOLEAN_COLUMN].notnull().sum())
+    print(f"  {matched} of {len(df)} row(s) hold a '{BOOLEAN_COLUMN}' value")
     if not matched:
         print("  Warning: no row was matched. Either no group held two similar enough descriptions, "
               "or the embeddings came back unusable; the clustering threshold lives in description_matching.")
