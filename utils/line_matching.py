@@ -227,3 +227,76 @@ def po_similarity(lines_a: Sequence[str], lines_b: Sequence[str], vectors: numpy
                     if max(weight_a[row], weight_b[column]) > 0),
                    key=lambda pair: pair[2], reverse=True)
     return containment, jaccard, pairs
+
+
+def category_similarity(categories_a: Sequence[tuple], categories_b: Sequence[tuple],
+                        weights: Dict[tuple, float],
+                        partial_credit: float = 0.5) -> Tuple[float, List[tuple]]:
+    """
+    Scores how much of what one PO buys from also appears on another, by category rather than by
+    wording.
+
+    This is the second relation the line score cannot see. A split that repeats the same items
+    across several POs shows up in the wording; a split that divides complementary items between
+    them does not, because a processor and the workstation it goes into share no words. Both are
+    end-user computing, so the pair is visible here.
+
+    Neither level of the taxonomy works alone. Level 1 holds only a handful of categories, so
+    matching on it by itself would pair every IT purchase in the institution with every other.
+    Level 2 discriminates properly but is decided by a judgement call the model can reasonably make
+    two ways, so a processor filed under datacentre compute and a workstation filed under end-user
+    computing would miss each other. So a level 1 that disagrees scores nothing at all, both levels
+    agreeing scores in full, and a level 1 agreeing on its own earns partial credit, which is enough
+    to reach the arbiter but not enough to stand as a verdict.
+
+    Args:
+        categories_a (Sequence[tuple]): The distinct categories of the first PO, as (level 1, level 2).
+        categories_b (Sequence[tuple]): The distinct categories of the second PO.
+        weights (Dict[tuple, float]): The weight of each category, from line_weights over the
+            category sets. A category every PO buys from cannot separate them, so it scores 0.
+        partial_credit (float, optional): What a level 1 agreeing on its own is worth. Defaults to 0.5.
+
+    Returns:
+        Tuple[float, List[tuple]]: The containment, and the matched categories with what each
+        scored, strongest first.
+    """
+
+    if not categories_a or not categories_b:
+        return 0.0, []
+
+    scores = numpy.zeros((len(categories_a), len(categories_b)), dtype=float)
+    for row, category_a in enumerate(categories_a):
+        for column, category_b in enumerate(categories_b):
+            if category_a == category_b:
+                scores[row, column] = 1.0
+            elif category_a[0] == category_b[0]:
+                scores[row, column] = partial_credit
+
+    rows, columns = linear_sum_assignment(scores, maximize=True)
+    matched = [(row, column) for row, column in zip(rows, columns) if scores[row, column] > 0]
+    if not matched:
+        return 0.0, []
+
+    weight_a = [weights.get(category, 1.0) for category in categories_a]
+    weight_b = [weights.get(category, 1.0) for category in categories_b]
+    total_a, total_b = sum(weight_a), sum(weight_b)
+
+    # Every category one of these POs buys from is a category every PO in the run buys from, so
+    # sharing them says nothing about which POs belong together. Unlike po_similarity this does NOT
+    # fall back to unweighted counts: two POs with identical wording really are evidence of a split,
+    # but two POs sitting in the categories everyone sits in are the null case, and scoring them 1.0
+    # would cluster the entire run.
+    if total_a <= 0 or total_b <= 0:
+        return 0.0, []
+
+    # A partial match contributes half of what an exact one does, so a pair held together only by
+    # level 1 agreement has to agree across more of what it buys to reach the same score.
+    matched_a = sum(scores[row, column] * weight_a[row] for row, column in matched)
+    matched_b = sum(scores[row, column] * weight_b[column] for row, column in matched)
+    containment = max(matched_a / total_a, matched_b / total_b)
+
+    pairs = sorted(((categories_a[row], categories_b[column], float(scores[row, column]))
+                    for row, column in matched
+                    if max(weight_a[row], weight_b[column]) > 0),
+                   key=lambda pair: pair[2], reverse=True)
+    return containment, pairs

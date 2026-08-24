@@ -15,6 +15,10 @@ ANALYSIS_DEFAULTS = {
     "match_mode": "blob",       # 'blob' embeds the whole joined description, 'line' each line item
     "line_separator": "||",     # what the line items of one PO are joined by
     "pair_score": "containment",  # which line mode score decides that two POs belong together
+    "use_categories": "false",  # whether line mode also matches on what each line item IS
+    "category_threshold": "0.60",   # the category containment two POs need to be clustered
+    "category_partial_credit": "0.5",  # what a level 1 category agreeing on its own is worth
+    "category_batch_size": "20",    # how many line items are categorised per request
 }
 
 _analysis_config = None

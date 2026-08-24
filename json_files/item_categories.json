@@ -1,0 +1,116 @@
+{
+  "_comment": "Procurement taxonomy used to judge whether two line items belong to the same purchase. level_1 is the broad spend area, level_2 the buying category within it. Read with read_json('item_categories'). Hand maintained: edit this file to add or reword a category, nothing in the Python holds these names.",
+  "_unclassified": "Items pending classification",
+  "categories": {
+    "Laboratory & Research": [
+      "Single-use labware and disposables",
+      "Bulk and fine chemicals for research use",
+      "Antibodies enzymes and molecular biology kits",
+      "Benchtop instruments under capitalisation threshold",
+      "Major scientific instruments above capitalisation threshold",
+      "Compressed gases liquid nitrogen and dewars",
+      "Licensed radioactive and scheduled materials",
+      "Outsourced analytical and testing services",
+      "Service contracts repairs and calibration for lab assets"
+    ],
+    "Animal Research": [
+      "Purchase of research animals",
+      "Diets bedding and enrichment consumables",
+      "Serology PCR pathology and sentinel testing panels",
+      "Clinical care anaesthesia and veterinary consumables",
+      "Caging racks and vivarium equipment"
+    ],
+    "IT & Technology": [
+      "End-user computing devices and peripherals",
+      "Datacentre compute and storage infrastructure",
+      "Network infrastructure and connectivity hardware",
+      "Perpetual and subscription software licensing",
+      "Infrastructure platform and hosting services",
+      "HPC cluster resources and GPU compute",
+      "Voice mobile and data communication services",
+      "Implementation integration and managed IT services",
+      "AV and conferencing hardware"
+    ],
+    "Education & Academic": [
+      "Physical books and printed collections",
+      "Databases e-journals and digital collections",
+      "Serial and periodical subscriptions",
+      "Instructional consumables and course materials",
+      "Article processing and publication charges",
+      "Field study and placement related costs",
+      "External assessment invigilation and accreditation"
+    ],
+    "Facilities & Estates": [
+      "New build and major capital works",
+      "Refurbishment alterations and interior works",
+      "Routine and reactive building upkeep",
+      "Climate control and mechanical plant",
+      "Electricity water gas and district cooling",
+      "Cleaning services and janitorial supplies",
+      "General recyclable and specialised waste disposal",
+      "External grounds maintenance",
+      "Guarding access control and surveillance",
+      "Office lab and public area furniture",
+      "Leased premises and space rental"
+    ],
+    "Professional Services": [
+      "Management strategy and technical advisory",
+      "External counsel and legal advisory",
+      "Internal and external audit services",
+      "Financial advisory bookkeeping and tax",
+      "Search agency and temporary staffing",
+      "Staff training courses and certification",
+      "Language services",
+      "Institutional and specialty insurance",
+      "Banking fees and financial service charges"
+    ],
+    "Research Administration": [
+      "Subawards to collaborating institutions",
+      "CRO trial site and monitoring services",
+      "Participant compensation and incentives",
+      "Patent filing prosecution and IP management",
+      "Data collection curation and repository services"
+    ],
+    "Office & Administration": [
+      "General consumable office materials",
+      "Print production and copy services",
+      "Mail courier and freight forwarding",
+      "Institutional memberships and dues"
+    ],
+    "Travel & Events": [
+      "Airfare and related travel booking",
+      "Hotel and lodging",
+      "Local transport car hire and transfers",
+      "Delegate registration and attendance",
+      "Food and beverage for institutional events",
+      "Event production and external venue hire"
+    ],
+    "Marketing & Communications": [
+      "Paid media placement and campaigns",
+      "Graphic design branding and creative production",
+      "Visual content production",
+      "Branded merchandise and giveaways",
+      "Institutional publications and prospectus"
+    ],
+    "Student Services": [
+      "Student financial awards",
+      "Health and wellbeing service provision",
+      "Residential hall operations and supplies",
+      "Athletic facilities equipment and programmes",
+      "Dining hall and food service operations"
+    ],
+    "Clinical & Medical": [
+      "Clinical disposables and supplies",
+      "Drugs and pharmaceutical products",
+      "Diagnostic and therapeutic clinical devices",
+      "Safety and protective wear"
+    ],
+    "General & Other": [
+      "Fleet vehicles and transport equipment",
+      "Short and long term equipment hire",
+      "Import duties clearance and specialised freight",
+      "Outgoing contributions and sponsorship",
+      "Items pending classification"
+    ]
+  }
+}

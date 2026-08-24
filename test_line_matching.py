@@ -18,8 +18,10 @@ import numpy
 import pandas
 
 import description_matching as dm
+import utils.item_categorizer as ic
 import utils.line_matching as lm
-from utils.line_matching import encode_lines, line_weights, parse_lines, po_similarity
+from utils.line_matching import (category_similarity, encode_lines, line_weights, parse_lines,
+                                 po_similarity)
 
 DIMENSIONS = 512
 failures = []
@@ -67,6 +69,12 @@ def fake_embed(strings, provider=None, model=None, **parameters):
 
 lm.embed = fake_embed  # line_matching imported the name directly, so it is patched there
 dm.embed = fake_embed
+
+# Nothing here may reach the categorisation endpoint either. Everything is unclassified until
+# section 15 replaces this with a stub that places things, so the checks before it exercise the
+# line score on its own.
+dm.classify_lines = lambda lines, batch_size=20, regenerate=False: {
+    line: ("General & Other", ic.UNCLASSIFIED) for line in lines}
 
 # Three real purchase orders, kept as they appear in the source data.
 PO1 = ("PCR Rush Charge || Diagnostic Pathology-Med/Lrg Species || NUS Rabbit PCR Profile A || "
@@ -196,12 +204,14 @@ check("the prompt still opens with the wording blob mode uses",
       all(prompt.startswith("Item Descriptions: [") for prompt in prompts))
 
 print("\n8. complete linkage refuses to chain A to C through B")
+# A shares a line with B, B shares a different line with C, A and C share nothing. Single or
+# average linkage would put all three in one cluster on the strength of B alone.
 chain = pandas.DataFrame({
     "Unique_Group_Number": [9, 9, 9],
     "Line_desc": [
-        "alpha reagent kit || beta reagent kit",
-        "beta reagent kit || gamma reagent kit",
-        "gamma reagent kit || delta reagent kit",
+        "alpha widget",
+        "alpha widget || zeta gadget",
+        "zeta gadget",
     ],
 })
 dm.api_query = lambda s, u, **kw: "Yes,Item descriptions are similar because they share a reagent."
@@ -225,6 +235,103 @@ blobbed = dm.description_matching(blob, "payment", regenerate=True, embedding_mo
 check("blob mode flags the duplicate pair",
       list(blobbed["Is Duplicate Payment"]) == ["Yes", "Yes"],
       str(list(blobbed["Is Duplicate Payment"])))
+
+print("\n11. the taxonomy loads and is well formed")
+taxonomy = ic.load_taxonomy()
+level_2_all = [level_2 for group in taxonomy.values() for level_2 in group]
+check("every level 1 category has level 2 categories under it",
+      all(len(group) > 0 for group in taxonomy.values()), f"{len(taxonomy)} level 1")
+check("no level 2 category is listed twice", len(level_2_all) == len(set(level_2_all)),
+      f"{len(level_2_all)} level 2")
+check("the unclassified bucket is in the taxonomy", ic.UNCLASSIFIED in level_2_all)
+print(f"        {len(taxonomy)} level 1 categories, {len(level_2_all)} level 2 categories")
+
+print("\n12. the categoriser reads the model's answer back correctly")
+batch = ["amd ryzen 9 7950x", "lenovo thinkstation p360", "unintelligible ref xyz"]
+answer = ("1|IT & Technology|End-user computing devices and peripherals\n"
+          "2|IT & Technology|Datacentre compute and storage infrastructure\n"
+          "3|Not A Real Level One|Whatever")
+parsed = ic.parse_answer(answer, batch)
+check("a valid answer parses", parsed[batch[0]] == ("IT & Technology", "End-user computing devices and peripherals"))
+check("an answer is matched by its item number, not its position",
+      parsed[batch[1]][1] == "Datacentre compute and storage infrastructure")
+check("an unknown level 1 is dropped", batch[2] not in parsed)
+check("a level 2 that does not belong to its level 1 keeps the level 1 only",
+      ic.parse_answer("1|IT & Technology|Hotel and lodging", batch)[batch[0]] == ("IT & Technology", None))
+check("a garbled answer yields nothing rather than a wrong category",
+      ic.parse_answer("I think item 1 is probably IT related", batch) == {})
+check("an out of range item number is ignored", ic.parse_answer("9|IT & Technology|Language services", batch) == {})
+
+print("\n13. category_similarity tiers level 1 against level 2")
+IT_USER = ("IT & Technology", "End-user computing devices and peripherals")
+IT_DATACENTRE = ("IT & Technology", "Datacentre compute and storage infrastructure")
+LAB = ("Laboratory & Research", "Bulk and fine chemicals for research use")
+score_exact, _ = category_similarity([IT_USER], [IT_USER], {}, 0.5)
+score_partial, _ = category_similarity([IT_USER], [IT_DATACENTRE], {}, 0.5)
+score_none, _ = category_similarity([IT_USER], [LAB], {}, 0.5)
+check("both levels agreeing scores in full", score_exact == 1.0, f"{score_exact:.2f}")
+check("level 1 agreeing alone earns partial credit", score_partial == 0.5, f"{score_partial:.2f}")
+check("level 1 disagreeing scores nothing", score_none == 0.0, f"{score_none:.2f}")
+check("a category every PO buys from is weighted out",
+      category_similarity([IT_USER], [IT_USER], {IT_USER: 0.0}, 0.5)[0] == 0.0)
+
+print("\n14. the AMD Ryzen and Lenovo ThinkStation case")
+ryzen, thinkstation = "amd ryzen 9 7950x processor", "lenovo thinkstation p360 workstation"
+vectors, index, weights, threshold = build([[ryzen], [thinkstation]])
+line_score, _, _ = po_similarity([ryzen], [thinkstation], vectors, index, weights, threshold)
+check("the line score does not see the pair, correctly", line_score == 0.0, f"{line_score:.3f}")
+for classified_as, expected in ((IT_USER, 1.0), (IT_DATACENTRE, 0.5)):
+    score, _ = category_similarity([IT_USER], [classified_as], {}, 0.5)
+    check(f"the category score does see it when the processor is filed under {classified_as[1][:28]}",
+          score >= 0.5, f"{score:.2f} (expected {expected})")
+
+print("\n15. end to end, complementary split with the categoriser stubbed")
+ic.classify_lines = lambda lines, batch_size=20, regenerate=False: {
+    line: (("IT & Technology", "End-user computing devices and peripherals") if
+           any(word in line for word in ("ryzen", "thinkstation", "monitor", "docking"))
+           else ("Laboratory & Research", "Bulk and fine chemicals for research use") if "reagent" in line
+           else ("General & Other", ic.UNCLASSIFIED))
+    for line in lines}
+dm.classify_lines = ic.classify_lines
+
+prompts = []
+dm.api_query = lambda s, u, **kw: (prompts.append(u),
+                                   "Yes,Item descriptions are similar because they are parts of one computer purchase.")[1]
+complementary = pandas.DataFrame({
+    "Unique_Group_Number": [1, 1, 2, 2],
+    "Line_desc": [
+        "amd ryzen 9 7950x processor || 64gb ddr5 memory module",
+        "lenovo thinkstation p360 workstation || dell u2723 monitor",
+        "sodium chloride analytical reagent 500g",
+        "amd ryzen 9 7950x processor || 64gb ddr5 memory module",
+    ],
+})
+ruled = dm.description_matching(complementary, "po", regenerate=True, embedding_model="all-mpnet-base-v2")
+check("the complementary split is caught despite no shared wording",
+      list(ruled.loc[[0, 1], "Is Split PO"]) == ["Yes", "Yes"],
+      str(list(ruled.loc[[0, 1], "Is Split PO"])))
+check("a reagent and a workstation are not clustered across categories",
+      ruled.at[2, "Is Split PO"] == "No", str(ruled.at[2, "Is Split PO"]))
+check("the category-only prompt asks the complementary question",
+      any("complementary parts of ONE purchase" in prompt for prompt in prompts))
+check("the category-only prompt says no wording matched",
+      any("NO line item matched on wording" in prompt for prompt in prompts))
+check("the category evidence is shown",
+      any("buy from the same categories" in prompt for prompt in prompts))
+if prompts:
+    print("        ---- category-only prompt ----")
+    for line in prompts[0].splitlines():
+        print(f"        {line[:110]}")
+
+print("\n16. categories can be switched off")
+import utils.AnalysisConfig as ac
+_real_option = ac.get_analysis_option
+dm.get_analysis_option = lambda a, o: "false" if o == "use_categories" else _real_option(a, o)
+off = dm.description_matching(complementary.drop(columns=["Is Split PO", "Explanation"]), "po",
+                              regenerate=True, embedding_model="all-mpnet-base-v2")
+check("with categories off the complementary split is missed again",
+      off.at[0, "Is Split PO"] == "No", str(off.at[0, "Is Split PO"]))
+dm.get_analysis_option = _real_option
 
 print("\n" + ("ALL CHECKS PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
 sys.exit(1 if failures else 0)

@@ -11,7 +11,9 @@ from utils.description_matching_enums import (PO_SET_COLUMN, PO_ITEM_DESC_COLUMN
                                               CONSTRAINTS, TASK)
 from typing import Literal
 from utils.shared_functions import string_from_enum
-from utils.line_matching import parse_lines, encode_lines, line_weights, po_similarity
+from utils.line_matching import (parse_lines, encode_lines, line_weights, po_similarity,
+                                 category_similarity)
+from utils.item_categorizer import UNCLASSIFIED, classify_lines, po_categories
 from sklearn.cluster import AgglomerativeClustering
 
 role = "audit associate"
@@ -283,6 +285,11 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         raise ValueError(f"Unknown pair_score '{pair_score}' for analysis '{analysis_type}' in "
                          f"analysis.config. Use 'containment' or 'jaccard'.")
 
+    use_categories = get_analysis_option(analysis_type, "use_categories").lower() == "true"
+    category_threshold = float(get_analysis_option(analysis_type, "category_threshold"))
+    category_partial_credit = float(get_analysis_option(analysis_type, "category_partial_credit"))
+    category_batch_size = int(get_analysis_option(analysis_type, "category_batch_size"))
+
     line_threshold = get_line_threshold(analysis_type, embedding_model_name)
     pair_threshold = get_pair_threshold(analysis_type, embedding_model_name)
     print(f"Embedding with '{embedding_model_name}', matching line items at a cosine similarity of "
@@ -322,6 +329,19 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
     print(f"Embedding {len(needed)} distinct line items across {len(selected)} {group_by} groups")
     vectors, index = encode_lines(needed, embedding_provider, embedding_model)
 
+    # What each line item IS, as opposed to how it is worded. Only the rows being analysed are
+    # categorised, because unlike parsing this costs a request, so the category weights are inverse
+    # document frequencies over those rows rather than over the whole frame.
+    row_categories, category_weights = {}, {}
+    if use_categories:
+        categories = classify_lines(needed, batch_size=category_batch_size, regenerate=regenerate)
+        row_categories = {row_index: po_categories(row_lines[row_index], categories)
+                          for _, row_indices in selected for row_index in row_indices}
+        category_weights = line_weights(list(row_categories.values()))
+        placed = sum(1 for value in categories.values() if value[1] != UNCLASSIFIED)
+        print(f"Categorised {placed} of {len(categories)} distinct line items, "
+              f"clustering rows at a category containment of at least {category_threshold}")
+
     default_verdict = split_verdict(default, default)
 
     for count, (group_ind, row_indices) in enumerate(selected, start=1):
@@ -329,6 +349,8 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         size = len(row_indices)
         distances = numpy.zeros((size, size), dtype=float)
         evidence = {}
+        category_evidence = {}
+        carried_by_line = set()
 
         for first in range(size):
             for second in range(first + 1, size):
@@ -336,19 +358,38 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                     row_lines[row_indices[first]], row_lines[row_indices[second]],
                     vectors, index, weights, line_threshold)
                 score = containment if pair_score == "containment" else jaccard
-                distances[first][second] = distances[second][first] = 1.0 - score
                 evidence[(first, second)] = pairs
+                linked = score >= pair_threshold
+                if linked:
+                    carried_by_line.add((first, second))
 
-        # Complete linkage, so a cluster forms only when EVERY pair inside it clears the threshold.
-        # Average or single linkage would let A join C on the strength of a shared B, and in sets
-        # this loosely built that chaining would quietly rebuild the set the analysis is meant to
-        # take apart. The epsilon makes a score of exactly pair_threshold count, matching the line
-        # threshold, which is also read as at-or-above.
+                # The two scores answer different questions against their own thresholds, so a pair
+                # only has to satisfy one of them. The line score asks whether the same items were
+                # bought twice; the category score asks whether the two POs buy from the same place
+                # in the taxonomy, which is the only way a purchase split into its complementary
+                # parts is visible at all.
+                if use_categories:
+                    category_score, category_pairs = category_similarity(
+                        row_categories[row_indices[first]], row_categories[row_indices[second]],
+                        category_weights, category_partial_credit)
+                    category_evidence[(first, second)] = category_pairs
+                    linked = linked or category_score >= category_threshold
+
+                # Recorded as linked or not rather than as a graded distance. Each score has already
+                # been read against its own threshold, and the two are not on a comparable scale, so
+                # there is nothing left for a distance to say. Complete linkage over this turns the
+                # clustering below into exactly 'every pair inside a cluster is linked'.
+                distances[first][second] = distances[second][first] = 0.0 if linked else 1.0
+
+        # Complete linkage, so a cluster forms only when EVERY pair inside it is linked. Average or
+        # single linkage would let A join C on the strength of a shared B, and in sets this loosely
+        # built that chaining would quietly rebuild the set the analysis is meant to take apart.
+        # The threshold sits between the linked distance of 0 and the unlinked distance of 1.
         labels = AgglomerativeClustering(
             n_clusters=None,
             metric='precomputed',
             linkage='complete',
-            distance_threshold=1.0 - pair_threshold + 1e-9
+            distance_threshold=0.5
         ).fit(distances).labels_
 
         clusters = {}
@@ -366,14 +407,24 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         for label, members in clusters.items():
             descriptions = [df.at[row_indices[position], item_description_column] for position in members]
 
-            pairs = []
+            pairs, category_pairs, line_carried = [], [], False
             for first in range(len(members)):
                 for second in range(first + 1, len(members)):
-                    pairs.extend(evidence.get((members[first], members[second]), []))
+                    key = (members[first], members[second])
+                    pairs.extend(evidence.get(key, []))
+                    category_pairs.extend(category_evidence.get(key, []))
+                    line_carried = line_carried or key in carried_by_line
             pairs = sorted(set(pairs), key=lambda pair: pair[2], reverse=True)[:MAX_EVIDENCE_PAIRS]
+            category_pairs = sorted(set(category_pairs), key=lambda pair: pair[2],
+                                    reverse=True)[:MAX_EVIDENCE_PAIRS]
 
-            print(f"Twin Analysis on cluster: {label}")
-            result = api_query(system_prompt, build_user_prompt(descriptions, pairs))
+            # A cluster no pair of which cleared the line threshold was held together entirely by
+            # what its rows buy, not by how anything is worded. Asking whether those descriptions
+            # look alike would only ever get one answer, so it is asked the other question instead.
+            print(f"Twin Analysis on cluster: {label}"
+                  f"{'' if line_carried else ' (matched on category only)'}")
+            result = api_query(system_prompt,
+                               build_user_prompt(descriptions, pairs, category_pairs, line_carried))
             if not result:
                 result = "Error,Something went wrong with the GenAI analysis."
             verdict = split_verdict(result, default)
@@ -389,28 +440,52 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
             break
 
 
-def build_user_prompt(descriptions: list, pairs: list) -> str:
+def build_user_prompt(descriptions: list, pairs: list, category_pairs: list = None,
+                      line_carried: bool = True) -> str:
     """
-    Builds the prompt for one cluster, listing the descriptions and the line items that matched
-    between them.
+    Builds the prompt for one cluster, listing the descriptions, the line items that matched
+    between them and the categories they share.
 
-    The first line is kept identical to the one blob mode sends, so the wording the system prompt
-    is written against does not shift. The matched line items are appended as the evidence behind
-    the cluster, which gives the model something specific to rule on and to quote in its
-    explanation rather than two long aggregated strings.
+    The first line is kept identical to the one blob mode sends, so the wording the system prompt is
+    written against does not shift. The evidence is appended below it, which gives the model
+    something specific to rule on and to quote in its explanation rather than several long
+    aggregated strings.
+
+    When nothing was matched on wording, the cluster exists only because its rows buy from the same
+    part of the taxonomy, and the question is put the other way round. Asking whether those
+    descriptions resemble each other would get one answer every time, which is exactly how a
+    purchase split into its complementary parts goes unnoticed.
 
     Args:
         descriptions (list): The full descriptions of the rows in the cluster.
         pairs (list): The matched line items, as (first, second, similarity), strongest first.
+        category_pairs (list, optional): The matched categories, as (first, second, score).
+        line_carried (bool, optional): Whether any pair in the cluster matched on wording. Defaults to True.
 
     Returns:
         str: The prompt.
     """
 
     prompt = f'''Item Descriptions: {descriptions}'''
+
     if pairs:
         matches = "\n".join(f'  {score:.2f}  "{first}"  <->  "{second}"'
                             for first, second, score in pairs)
         prompt += ("\n\nThese individual line items matched across the descriptions above, with "
                    f"their similarity:\n{matches}")
+
+    if category_pairs:
+        matches = "\n".join(f'  {score:.2f}  {first[0]} / {first[1]}  <->  {second[0]} / {second[1]}'
+                            for first, second, score in category_pairs)
+        prompt += ("\n\nThese purchase orders buy from the same categories, scored 1.00 where both "
+                   f"levels agree and lower where only the broad category does:\n{matches}")
+
+    if not line_carried:
+        prompt += ("\n\nNote that NO line item matched on wording here. These purchase orders were "
+                   "put together only because of what they buy. Judge whether they are the "
+                   "complementary parts of ONE purchase that has been divided between them, for "
+                   "example equipment on one and the components, accessories or installation for "
+                   "that same equipment on another. Answer 'No' if they are simply unrelated "
+                   "purchases that happen to fall in the same category.")
+
     return prompt
