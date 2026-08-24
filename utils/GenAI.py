@@ -32,6 +32,7 @@ LLM_CONFIG_ENV_OVERRIDES = {
 
 _llm_config = None
 _llm_clients = {}
+_embedding_models = {}
 
 
 def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: bool = False) -> configparser.ConfigParser:
@@ -56,6 +57,7 @@ def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: boo
             raise FileNotFoundError(f"LLM configuration file not found at '{config_path}'.")
         _llm_config = parser
         _llm_clients.clear()  # rebuild the clients from the reloaded settings
+        _embedding_models.clear()
     return _llm_config
 
 
@@ -267,6 +269,157 @@ def api_embed(strings: List[str], model: str = None, **parameters) -> List[List[
 
     embeddings = sorted(response.data, key=lambda embedding: embedding.index)
     return [embedding.embedding for embedding in embeddings]
+
+
+def get_embedding_provider(provider: str = None) -> str:
+    """
+    Returns the embedding provider in force, either the one passed in or the one set in llm.config.
+
+    Args:
+        provider (str, optional): Overrides the provider configured in the [embedding] section.
+
+    Returns:
+        str: Either 'api' or 'local'.
+
+    Raises:
+        ValueError: If the resolved provider is not one of those two.
+    """
+
+    provider = (provider or get_llm_config("embedding").get("provider") or "api").strip().lower()
+    if provider not in ("api", "local"):
+        raise ValueError(f"Unknown embedding provider '{provider}' in '{LLM_CONFIG_PATH}'. Use 'api' or 'local'.")
+    return provider
+
+
+def get_embedding_model_name(provider: str = None, model: str = None) -> str:
+    """
+    Returns the name of the embedding model the given provider will use. Needed to look up the
+    clustering threshold, which is calibrated per model.
+
+    Args:
+        provider (str, optional): Overrides the provider configured in the [embedding] section.
+        model (str, optional): Overrides the model configured for that provider.
+
+    Returns:
+        str: The model name.
+    """
+
+    if model:
+        return model
+    section = "embedding.local" if get_embedding_provider(provider) == "local" else "embedding"
+    return get_llm_config(section)["model"]
+
+
+def get_embedding_model(model: str = None):
+    """
+    Returns a cached sentence-transformers model built from the [embedding.local] section of llm.config.
+    The import is deferred so that running with provider = api needs no sentence-transformers install.
+
+    Args:
+        model (str, optional): Overrides the model configured in the [embedding.local] section.
+
+    Returns:
+        SentenceTransformer: The loaded model, cached so it loads once per process.
+
+    Raises:
+        ImportError: If sentence-transformers is not installed.
+    """
+
+    settings = get_llm_config("embedding.local")
+    name = model or settings["model"]
+
+    if name not in _embedding_models:
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise ImportError(
+                "provider = local needs sentence-transformers. Install it with "
+                "'pip install sentence-transformers', or set provider = api in llm.config."
+            ) from e
+
+        arguments = {}
+        if settings.get("device"):
+            arguments["device"] = settings["device"]
+        for option in ("trust_remote_code", "local_files_only"):
+            if settings.get(option):
+                arguments[option] = settings[option].strip().lower() == "true"
+
+        print(f"Loading embedding model '{name}' (first run downloads the weights)")
+        _embedding_models[name] = SentenceTransformer(name, **arguments)
+    return _embedding_models[name]
+
+
+def local_embed(strings: List[str], model: str = None, **parameters) -> List[List[float]]:
+    """
+    Generates embeddings for a list of strings with a sentence-transformers model on this machine.
+
+    Args:
+        strings (List[str]): The strings to generate embeddings for.
+        model (str, optional): Overrides the model configured in the [embedding.local] section of llm.config.
+        **parameters: Additional encode parameters that override llm.config (e.g. batch_size, device).
+
+    Returns:
+        List[List[float]]: The embedding vector of each string, in the same order as the strings provided.
+    """
+
+    settings = get_llm_config("embedding.local")
+    encoder = get_embedding_model(model)
+
+    arguments = {"normalize_embeddings": settings.get("normalize", "true").strip().lower() == "true"}
+    if settings.get("batch_size"):
+        arguments["batch_size"] = int(settings["batch_size"])
+    arguments.update(parameters)
+
+    return encoder.encode(list(strings), **arguments).tolist()
+
+
+def embed(strings: List[str], provider: str = None, model: str = None, **parameters) -> List[List[float]]:
+    """
+    Generates embeddings with whichever provider llm.config selects, so callers do not care which.
+
+    Args:
+        strings (List[str]): The strings to generate embeddings for.
+        provider (str, optional): Overrides the provider configured in the [embedding] section, 'api' or 'local'.
+        model (str, optional): Overrides the model configured for that provider.
+        **parameters: Additional parameters passed on to the chosen provider.
+
+    Returns:
+        List[List[float]]: The embedding vector of each string, in the same order as the strings provided.
+        The api provider returns None if the request fails.
+    """
+
+    if get_embedding_provider(provider) == "local":
+        return local_embed(strings, model=model, **parameters)
+    return api_embed(strings, model=model, **parameters)
+
+
+def get_cluster_threshold(analysis_type: str, provider: str = None, model: str = None) -> float:
+    """
+    Returns the cosine distance threshold to cluster at, for the embedding model in force. Every model
+    has its own distance distribution, so a threshold calibrated for one model does not carry to another.
+
+    Args:
+        analysis_type (str): The analysis being run, either 'po' or 'payment'.
+        provider (str, optional): Overrides the provider configured in the [embedding] section.
+        model (str, optional): Overrides the model configured for that provider.
+
+    Returns:
+        float: The distance threshold below which two descriptions join the same cluster.
+
+    Raises:
+        KeyError: If no threshold is configured for that analysis type and model.
+    """
+
+    name = get_embedding_model_name(provider, model)
+    section = f"threshold.{analysis_type}"
+    value = get_llm_config(section).get(name.strip().lower())
+
+    if value is None:
+        raise KeyError(
+            f"No clustering threshold for embedding model '{name}' in section '[{section}]' of "
+            f"'{LLM_CONFIG_PATH}'. Add one and calibrate it before running with this model."
+        )
+    return float(value)
 
 
 def api_query(system_prompt: str, user_prompt: str, model: str = None, **parameters) -> str:
