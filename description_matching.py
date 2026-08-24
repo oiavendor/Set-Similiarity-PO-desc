@@ -1,12 +1,19 @@
 import pandas
-from utils.GenAI import embed, generate_system_prompt, api_query, get_cluster_threshold, get_embedding_model_name
-from utils.description_matching_enums import PO_ITEM_DESC_COLUMN, PO_SET_COLUMN, PAYMENT_ITEM_DESC_COLUMN, PAYMENT_SET_COLUMN, PO_CONTEXT, CONSTRAINTS, TASK, PO_SPLIT_BOOLEAN_COLUMN, EXPLANATION_COLUMN, PO_DEFAULT_NON_CLUSTERED, PAYMENT_CONTEXT, PAYMENT_DUPP_BOOLEAN_COLUMN, PAYMENT_DEFAULT_NON_CLUSTERED
+from utils.GenAI import embed, generate_system_prompt, api_query, get_embedding_model_name
+from utils.AnalysisConfig import get_cluster_threshold
+from utils.description_matching_enums import (PO_SET_COLUMN, PO_ITEM_DESC_COLUMN, PO_SPLIT_BOOLEAN_COLUMN,
+                                              PO_EXPLANATION_COLUMN, PO_DEFAULT_NON_CLUSTERED,
+                                              PAYMENT_SET_COLUMN, PAYMENT_ITEM_DESC_COLUMN,
+                                              PAYMENT_DUPP_BOOLEAN_COLUMN, PAYMENT_EXPLANATION_COLUMN,
+                                              PAYMENT_DEFAULT_NON_CLUSTERED, PO_CONTEXT, PAYMENT_CONTEXT,
+                                              CONSTRAINTS, TASK)
 from typing import Literal
 from utils.shared_functions import string_from_enum
 from sklearn.cluster import AgglomerativeClustering
 
 role = "audit associate"
 task = "identify if the list of item descriptions are for"
+
 
 def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "payment"], regenerate: bool = False,
                          modify_number: int = 500, embedding_provider: str = None,
@@ -26,19 +33,24 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
         item_description_column = PO_ITEM_DESC_COLUMN
         context = string_from_enum(PO_CONTEXT)
         boolean_column = PO_SPLIT_BOOLEAN_COLUMN
+        explanation_column = PO_EXPLANATION_COLUMN
     elif analysis_type == "payment":
         group_by = PAYMENT_SET_COLUMN
         item_description_column = PAYMENT_ITEM_DESC_COLUMN
         context = string_from_enum(PAYMENT_CONTEXT)
         boolean_column = PAYMENT_DUPP_BOOLEAN_COLUMN
-    threshold = get_cluster_threshold(analysis_type, embedding_provider, embedding_model)
-    print(f"Embedding with '{get_embedding_model_name(embedding_provider, embedding_model)}', "
+        explanation_column = PAYMENT_EXPLANATION_COLUMN
+    else:
+        raise ValueError(f"Unknown analysis_type '{analysis_type}'. Use 'po' or 'payment'.")
+
+    embedding_model_name = get_embedding_model_name(embedding_provider, embedding_model)
+    threshold = get_cluster_threshold(analysis_type, embedding_model_name)
+    print(f"Embedding with '{embedding_model_name}', "
           f"clustering at a cosine distance below {threshold}")
 
     grouped_df = df.groupby(group_by)
     df_size = len(grouped_df)
     count = 1
-    explanation_column = EXPLANATION_COLUMN
     constraints = string_from_enum(CONSTRAINTS)
 
     system_prompt = generate_system_prompt(role=role, 
