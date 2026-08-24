@@ -19,8 +19,8 @@ from utils.AnalysisConfig import get_analysis_config, get_cluster_threshold
 from utils.GenAI import (api_query, embed, get_embedding_model_name,
                          get_embedding_provider, get_llm_config)
 
-INPUT_FILE = r"xxx"
-OUTPUT_FILE = r"xxx"
+INPUT_FILE = r"C:\Users\airts_2026\Desktop\Github-Repo (Vendor)\Set-Similiarity-PO-desc\data\Analysis - Split PO.xlsx"
+OUTPUT_FILE = r"C:\Users\airts_2026\Desktop\Github-Repo (Vendor)\Set-Similiarity-PO-desc\data\Analysis - Split PO_output.xlsx"
 
 ANALYSIS_TYPE = "po"
 REGENERATE = True
@@ -188,8 +188,11 @@ def test_description_matching() -> bool:
     print(f"  Read {len(df)} row(s) from {INPUT_FILE}")
 
     if not check_columns(df):
-        print()
+        print("columns check failed")
         return False
+    else:
+        print("columns check success")
+
 
     debug(f"input frame:\n{df.head(10).to_string()}")
 
@@ -238,3 +241,12 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+""""
+PCR Rush Charge || Diagnostic Pathology-Med/Lrg Species || NUS Rabbit PCR Profile A || Diagnostic Rodent Pathology || GPAV MFI Serology Test (s) || NUS Mouse Diet PCR Panel || NUS Rabbit Serology Profile A || Diagnostic Aquatics Pathology (Non-Fish) || NUS Guinea Pig PCR Profile A || RHDV-Elisa-Send Out Testing (CRL) || PCR Pooling Fee
+NUS Guinea Pig PCR Profile C || Diagnostic Pathology Services- medium/large species(non-NHP) || NUS Guinea Pig Serology Profile A
+Pathology-Medium service (7-13cm) || Diagnostic Pathology Services- medium/large species(non-NHP) || NUS Mouse Diet PCR Panel || NUS Rabbit PCR Profile A || RHDV-ELISA || NUS Rabbit Serology  Profile A
+
+"""
