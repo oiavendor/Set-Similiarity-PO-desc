@@ -1,5 +1,5 @@
 import pandas
-from utils.GenAI import api_embed, generate_system_prompt, api_query
+from utils.GenAI import embed, generate_system_prompt, api_query, get_cluster_threshold, get_embedding_model_name
 from utils.description_matching_enums import PO_ITEM_DESC_COLUMN, PO_SET_COLUMN, PAYMENT_ITEM_DESC_COLUMN, PAYMENT_SET_COLUMN, PO_CONTEXT, CONSTRAINTS, TASK, PO_SPLIT_BOOLEAN_COLUMN, EXPLANATION_COLUMN, PO_DEFAULT_NON_CLUSTERED, PAYMENT_CONTEXT, PAYMENT_DUPP_BOOLEAN_COLUMN, PAYMENT_DEFAULT_NON_CLUSTERED
 from typing import Literal
 from utils.shared_functions import string_from_enum
@@ -8,13 +8,16 @@ from sklearn.cluster import AgglomerativeClustering
 role = "audit associate"
 task = "identify if the list of item descriptions are for"
 
-def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "payment"], regenerate: bool = False, modify_number: int = 500) -> pandas.DataFrame:
+def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "payment"], regenerate: bool = False,
+                         modify_number: int = 500, embedding_provider: str = None,
+                         embedding_model: str = None) -> pandas.DataFrame:
 
-    def map_dict(cell, mapping_dict, default=PO_DEFAULT_NON_CLUSTERED if analysis_type == "po" else PAYMENT_DEFAULT_NON_CLUSTERED):
-        for key, value_list in mapping_dict.items():
-            if cell in value_list:
-                response_list = key.split(",", 1)
-                return (response_list[0], response_list[1].strip())
+    def map_dict(cell, cluster_results, default=PO_DEFAULT_NON_CLUSTERED if analysis_type == "po" else PAYMENT_DEFAULT_NON_CLUSTERED):
+        for result, descriptions in cluster_results:
+            if cell in descriptions:
+                response_list = result.split(",", 1)
+                if len(response_list) == 2:
+                    return (response_list[0], response_list[1].strip())
         default_list = default.split(",", 1)
         return (default_list[0], default_list[1])
 
@@ -23,13 +26,15 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
         item_description_column = PO_ITEM_DESC_COLUMN
         context = string_from_enum(PO_CONTEXT)
         boolean_column = PO_SPLIT_BOOLEAN_COLUMN
-        threshold = 0.2
     elif analysis_type == "payment":
         group_by = PAYMENT_SET_COLUMN
         item_description_column = PAYMENT_ITEM_DESC_COLUMN
         context = string_from_enum(PAYMENT_CONTEXT)
         boolean_column = PAYMENT_DUPP_BOOLEAN_COLUMN
-        threshold = 0.05
+    threshold = get_cluster_threshold(analysis_type, embedding_provider, embedding_model)
+    print(f"Embedding with '{get_embedding_model_name(embedding_provider, embedding_model)}', "
+          f"clustering at a cosine distance below {threshold}")
+
     grouped_df = df.groupby(group_by)
     df_size = len(grouped_df)
     count = 1
@@ -47,7 +52,7 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
             print(f"Not regenerating for {group_by}: {group_ind}/{df_size} as there are exisiting values for all datapoints.")
             continue
         item_descriptions = group_data[item_description_column].tolist()
-        processed_embeddings = api_embed(item_descriptions)
+        processed_embeddings = embed(item_descriptions, embedding_provider, embedding_model)
         item_clusters = AgglomerativeClustering(
             n_clusters=None,
             metric='cosine',
@@ -63,7 +68,7 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
         similar_cluster = similar_cluster.groupby("cluster")
         cluster_len = len(similar_cluster)
         if cluster_len > 0:
-            original_df_mapping: dict[str, list[str]] = {}
+            cluster_results: list[tuple[str, list[str]]] = []
             print(f"Found {cluster_len} clusters for {group_by}: {group_ind}")
             for cluster_ind, cluster_data in similar_cluster:
                 cluster_description_list = cluster_data[item_description_column].tolist()
@@ -72,8 +77,8 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
                 result = api_query(system_prompt, user_prompt)
                 if not result:
                     result = "Error,Something went wrong with the GenAI analysis."
-                original_df_mapping[result] = cluster_description_list
-            df.loc[df[group_by] == group_ind, [boolean_column, explanation_column]] = df[df[group_by] == group_ind][item_description_column].apply(lambda desc: pandas.Series(map_dict(desc, original_df_mapping))).to_numpy()
+                cluster_results.append((result, cluster_description_list))
+            df.loc[df[group_by] == group_ind, [boolean_column, explanation_column]] = df[df[group_by] == group_ind][item_description_column].apply(lambda desc: pandas.Series(map_dict(desc, cluster_results))).to_numpy()
         
         if count == modify_number:
             print(f"Modified {count} datapoints")

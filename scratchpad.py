@@ -15,7 +15,8 @@ from pathlib import Path
 import pandas
 
 from description_matching import description_matching
-from utils.GenAI import api_embed, api_query, get_llm_config
+from utils.GenAI import (api_query, embed, get_cluster_threshold, get_embedding_model_name,
+                         get_embedding_provider, get_llm_config)
 from utils.description_matching_enums import (
     EXPLANATION_COLUMN,
     PO_ITEM_DESC_COLUMN,
@@ -93,20 +94,30 @@ def test_llm_connection() -> bool:
 
 def test_embedding_connection() -> bool:
     """
-    Sends a probe string to the embeddings endpoint configured in the [embedding] section of llm.config.
-    description_matching clusters on these embeddings, so the flow cannot run without them.
+    Sends a probe string to whichever embedding provider llm.config selects. description_matching
+    clusters on these embeddings, so the flow cannot run without them.
 
     Returns:
-        bool: True if the endpoint returned a vector, False otherwise.
+        bool: True if the provider returned a vector, False otherwise.
     """
 
-    print("[2/3] Testing the [embedding] endpoint")
-    describe_section("embedding")
+    provider = get_embedding_provider()
+    model = get_embedding_model_name()
+    print(f"[2/3] Testing the '{provider}' embedding provider")
 
-    embeddings = api_embed(["connectivity probe"])
+    if provider == "local":
+        print(f"  [embedding.local] model = {model}")
+        debug(f"[embedding.local] {get_llm_config('embedding.local')}")
+    else:
+        describe_section("embedding")
+
+    threshold = get_cluster_threshold(ANALYSIS_TYPE, provider, model)
+    print(f"  Clustering threshold for '{model}' / '{ANALYSIS_TYPE}': {threshold}")
+
+    embeddings = embed(["connectivity probe", "connectivity probe"])
 
     if not embeddings:
-        print("  FAILED: no vector from the embeddings endpoint.\n")
+        print("  FAILED: no vector from the embedding provider.\n")
         return False
 
     debug(f"first 8 dimensions: {embeddings[0][:8]}")
