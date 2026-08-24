@@ -14,7 +14,12 @@ import pandas as pd
 # from googlesearch import search
 
 
-LLM_CONFIG_PATH = Path(__file__).resolve().parent.parent / "llm.config"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LLM_CONFIG_PATH = PROJECT_ROOT / "llm.config"
+
+# Secrets are kept out of llm.config so that file stays safe to commit. This one is
+# gitignored, optional, and anything it sets wins over llm.config.
+LLM_SECRETS_PATH = PROJECT_ROOT / "llm.secrets.config"
 
 # Environment variables that take precedence over the values in llm.config.
 LLM_CONFIG_ENV_OVERRIDES = {
@@ -37,17 +42,21 @@ _embedding_models = {}
 
 def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: bool = False) -> configparser.ConfigParser:
     """
-    Loads and caches the llm.config file holding the settings of the OpenAI-compatible endpoints.
+    Loads and caches the llm.config file holding the settings of the OpenAI-compatible endpoints,
+    then layers llm.secrets.config over it when that file is present.
+
+    Settings resolve in order of increasing precedence: llm.config, llm.secrets.config, environment
+    variable. Keeping credentials in the gitignored secrets file leaves llm.config safe to commit.
 
     Args:
         config_path (Union[str, Path], optional): Path to the configuration file. Defaults to llm.config in the project root.
-        reload (bool, optional): Whether to re-read the file instead of using the cached configuration. Defaults to False.
+        reload (bool, optional): Whether to re-read the files instead of using the cached configuration. Defaults to False.
 
     Returns:
         configparser.ConfigParser: The parsed configuration.
 
     Raises:
-        FileNotFoundError: If the configuration file does not exist.
+        FileNotFoundError: If llm.config does not exist. The secrets file is optional.
     """
 
     global _llm_config
@@ -55,6 +64,7 @@ def load_llm_config(config_path: Union[str, Path] = LLM_CONFIG_PATH, reload: boo
         parser = configparser.ConfigParser(interpolation=None)
         if not parser.read(config_path, encoding="utf-8"):
             raise FileNotFoundError(f"LLM configuration file not found at '{config_path}'.")
+        parser.read(LLM_SECRETS_PATH, encoding="utf-8")  # optional, overrides what llm.config set
         _llm_config = parser
         _llm_clients.clear()  # rebuild the clients from the reloaded settings
         _embedding_models.clear()
@@ -310,6 +320,63 @@ def get_embedding_model_name(provider: str = None, model: str = None) -> str:
     return get_llm_config(section)["model"]
 
 
+def get_models_dir() -> Path:
+    """
+    Returns the directory holding the locally kept sentence-transformers models. A relative
+    models_dir is resolved against the project root, not the working directory, so the pipeline
+    behaves the same whichever folder it is launched from.
+
+    Returns:
+        Path: The directory the models are kept in.
+    """
+
+    configured = Path(get_llm_config("embedding.local").get("models_dir") or "models")
+    return configured if configured.is_absolute() else PROJECT_ROOT / configured
+
+
+def resolve_embedding_model(name: str) -> Union[str, Path]:
+    """
+    Returns what to hand SentenceTransformer for a model name: the vendored directory when the
+    model has been kept locally, otherwise the name itself for HuggingFace to resolve.
+
+    Args:
+        name (str): The model name, e.g. 'all-MiniLM-L6-v2'.
+
+    Returns:
+        Union[str, Path]: The local directory if it exists, the name unchanged if it does not.
+    """
+
+    directory = get_models_dir() / name
+    return directory if directory.is_dir() else name
+
+
+def download_embedding_model(name: str = None) -> Path:
+    """
+    Downloads a sentence-transformers model into the models directory so it can be used on a
+    machine with no access to huggingface.co. Run this once from a machine that does have access.
+
+    Args:
+        name (str, optional): The model to download. Defaults to the one in the [embedding.local] section.
+
+    Returns:
+        Path: The directory the model was saved to.
+    """
+
+    from sentence_transformers import SentenceTransformer
+
+    name = name or get_llm_config("embedding.local")["model"]
+    target = get_models_dir() / name
+
+    if target.is_dir():
+        print(f"'{name}' is already kept at {target}")
+        return target
+
+    print(f"Downloading '{name}' into {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    SentenceTransformer(name).save(str(target))
+    return target
+
+
 def get_embedding_model(model: str = None):
     """
     Returns a cached sentence-transformers model built from the [embedding.local] section of llm.config.
@@ -344,8 +411,12 @@ def get_embedding_model(model: str = None):
             if settings.get(option):
                 arguments[option] = settings[option].strip().lower() == "true"
 
-        print(f"Loading embedding model '{name}' (first run downloads the weights)")
-        _embedding_models[name] = SentenceTransformer(name, **arguments)
+        source = resolve_embedding_model(name)
+        if isinstance(source, Path):
+            print(f"Loading embedding model '{name}' from {source}")
+        else:
+            print(f"Loading embedding model '{name}' from HuggingFace (first run downloads the weights)")
+        _embedding_models[name] = SentenceTransformer(str(source), **arguments)
     return _embedding_models[name]
 
 
