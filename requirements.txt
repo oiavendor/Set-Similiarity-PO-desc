@@ -1,5 +1,6 @@
 openai>=1.66
 scikit-learn  # description_matching clusters with AgglomerativeClustering
+scipy  # line matching resolves its line item scores into a one to one assignment
 sentence-transformers  # only needed when llm.config sets [embedding] provider = local
 pandas[excel]
 requests
