@@ -1,6 +1,7 @@
 openai>=1.66
 scikit-learn  # description_matching clusters with AgglomerativeClustering
 scipy  # line matching resolves its line item scores into a one to one assignment
+rapidfuzz  # the Set Similarity column scores descriptions with token_set_ratio
 sentence-transformers  # only needed when llm.config sets [embedding] provider = local
 pandas[excel]
 requests

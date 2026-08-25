@@ -1,5 +1,6 @@
 import numpy
 import pandas
+from rapidfuzz import fuzz
 from utils.GenAI import embed, generate_system_prompt, api_query, get_embedding_model_name
 from utils.AnalysisConfig import (get_analysis_option, get_cluster_threshold, get_line_threshold,
                                   get_pair_threshold)
@@ -59,6 +60,10 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
         line  splits the description on line_separator and matches the line items directly,
               aggregating similarity scores rather than vectors. See utils/line_matching.py.
 
+    The po analysis also gets a 'Set Similarity' column: each row's best token_set_ratio (0 to
+    100) against the other descriptions in its set. It is a plain string measure written
+    alongside the verdicts and feeds nothing downstream. See set_similarity_column.
+
     Args:
         df (pandas.DataFrame): The rows to analyse.
         analysis_type (Literal['po', 'payment']): Which analysis to run, naming a section of analysis.config.
@@ -98,6 +103,12 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
     for column in (boolean_column, explanation_column):
         if column not in df.columns:
             df[column] = pandas.NA
+
+    # Written before the verdict pass and independent of it, so the column is complete even when
+    # a run capped by modify_number leaves verdicts for later. Only the po analysis carries it.
+    if analysis_type == "po":
+        set_similarity_column(df, group_by, item_description_column,
+                              get_analysis_option(analysis_type, "line_separator"))
 
     embedding_model_name = get_embedding_model_name(embedding_provider, embedding_model)
     constraints = string_from_enum(CONSTRAINTS)
@@ -159,6 +170,85 @@ def fill_empty_verdicts(df: pandas.DataFrame, boolean_column: str, explanation_c
 
     if filled:
         print(f"Filled {filled} rows that held no verdict with the analysis default '{verdict}'")
+
+
+def normalize_description(text, separator: str) -> str:
+    """
+    Normalises one whole aggregated description for token set comparison.
+
+    The separator is replaced with a space rather than stripped, so the words either side of it
+    stay separate tokens and the separator itself can never count as wording two rows share.
+    Whitespace is collapsed and case folded the same way individual line items are in line mode.
+
+    Args:
+        text: The aggregated description of one row. Non-string values, including NaN, yield ''.
+        separator (str): The delimiter the line items are joined by.
+
+    Returns:
+        str: The normalised description.
+    """
+
+    if text is None or text != text:  # None, or a NaN, which is not equal to itself
+        return ""
+    return " ".join(str(text).replace(separator, " ").split()).casefold()
+
+
+def set_similarity_column(df: pandas.DataFrame, group_by: str, item_description_column: str,
+                          separator: str, column_name: str = "Set Similarity") -> None:
+    """
+    Writes each row's best token_set_ratio against the other descriptions in its set, in place.
+
+    This is a plain string measure reported alongside the verdicts, not an input to them: nothing
+    downstream reads the column. token_set_ratio tokenises both descriptions on whitespace and
+    scores the overlap of the two token SETS from 0 to 100, ignoring word order and repetition.
+    Because the shared tokens are scored on their own, a small PO whose wording is wholly absorbed
+    into a larger one still scores near 100 despite the size gap, which is the same containment
+    idea line mode computes, at word level. What it cannot see is meaning: 'laptop' and 'notebook
+    computer' share no tokens and score low here even though an embedding places them together.
+
+    It costs no requests, so every group is scored on every run regardless of regenerate and
+    modify_number. A row alone in its set has nothing to be compared against and stays blank,
+    which keeps 'no partner exists' distinct from 'a partner exists and shares no wording'.
+
+    Args:
+        df (pandas.DataFrame): The frame to write the column into.
+        group_by (str): The column rows are grouped by; the rows sharing a value are one set.
+        item_description_column (str): The column holding the aggregated line item descriptions.
+        separator (str): What the line items of one row are joined by.
+        column_name (str, optional): The column written. Defaults to 'Set Similarity'.
+
+    Raises:
+        ValueError: If the frame's index is not unique.
+    """
+
+    if not df.index.is_unique:
+        raise ValueError("Set similarity addresses rows by index label, so the frame needs a "
+                         "unique index. Call df.reset_index(drop=True) before passing it in.")
+
+    if column_name not in df.columns:
+        df[column_name] = pandas.NA
+
+    print(f"Scoring '{column_name}' with token_set_ratio within each {group_by} group")
+
+    for group_ind, group_data in df.groupby(group_by):
+        if len(group_data) < 2:
+            continue
+        texts = [normalize_description(text, separator)
+                 for text in group_data[item_description_column]]
+
+        size = len(texts)
+        best = [0.0] * size
+        for first in range(size):
+            for second in range(first + 1, size):
+                # Two blank descriptions share an absence of text, not wording, so a blank scores
+                # 0 against everything rather than 100 against another blank.
+                if texts[first] and texts[second]:
+                    ratio = float(fuzz.token_set_ratio(texts[first], texts[second]))
+                    best[first] = max(best[first], ratio)
+                    best[second] = max(best[second], ratio)
+
+        for row_index, score in zip(group_data.index, best):
+            df.at[row_index, column_name] = round(score, 1)
 
 
 def blob_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_description_column: str,
