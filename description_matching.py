@@ -46,7 +46,7 @@ def split_verdict(text: str, default: str) -> tuple:
 
 
 def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "payment"], regenerate: bool = False,
-                         modify_number: int = 500, embedding_provider: str = None,
+                         modify_number: int = None, embedding_provider: str = None,
                          embedding_model: str = None, fill_empty: bool = True) -> pandas.DataFrame:
     """
     Clusters the rows of each group by how alike their item descriptions are, then asks the
@@ -64,16 +64,14 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
     100) against the other descriptions in its set. It is a plain string measure written
     alongside the verdicts and feeds nothing downstream. See set_similarity_column.
 
-    When an analysis names local_assessment_column and arbiter_assessment_column in
-    analysis.config, line mode also writes per row which stage decided its verdict: what the
-    local embedding model concluded, and what the language model ruled where it was consulted.
-    Both columns are placed immediately after the description column in the returned frame.
-
     Args:
         df (pandas.DataFrame): The rows to analyse.
         analysis_type (Literal['po', 'payment']): Which analysis to run, naming a section of analysis.config.
         regenerate (bool, optional): Whether to re-analyse groups that already hold verdicts. Defaults to False.
-        modify_number (int, optional): How many groups to analyse before stopping. Defaults to 500.
+        modify_number (int, optional): How many groups to analyse before stopping. Defaults to None,
+            which analyses every group. A cap leaves the groups it never reached filled with the
+            analysis default, which reads as 'No' in the output without anything having been
+            compared, so only set one for a deliberately partial trial run.
         embedding_provider (str, optional): Overrides the embedding provider configured in llm.config.
         embedding_model (str, optional): Overrides the embedding model configured for that provider.
         fill_empty (bool, optional): Whether to fill every row left without a verdict with the
@@ -124,19 +122,6 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
                                            constraints=constraints)
 
     match_mode = get_analysis_option(analysis_type, "match_mode").lower()
-
-    # Only line mode computes anything worth reporting per stage, so the assessment columns are
-    # dropped rather than written empty when a blob analysis configures them by mistake.
-    local_assessment_column = get_analysis_option(analysis_type, "local_assessment_column")
-    arbiter_assessment_column = get_analysis_option(analysis_type, "arbiter_assessment_column")
-    if match_mode != "line" and (local_assessment_column or arbiter_assessment_column):
-        print(f"Assessment columns are only written in line mode; analysis '{analysis_type}' "
-              f"runs in '{match_mode}' mode, so they are skipped.")
-        local_assessment_column = arbiter_assessment_column = ""
-    for column in (local_assessment_column, arbiter_assessment_column):
-        if column and column not in df.columns:
-            df[column] = pandas.NA
-
     arguments = dict(df=df, group_by=group_by, item_description_column=item_description_column,
                      boolean_column=boolean_column, explanation_column=explanation_column,
                      default=default, system_prompt=system_prompt,
@@ -145,8 +130,7 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
                      regenerate=regenerate, modify_number=modify_number)
 
     if match_mode == "line":
-        line_matching(analysis_type=analysis_type, local_assessment_column=local_assessment_column,
-                      arbiter_assessment_column=arbiter_assessment_column, **arguments)
+        line_matching(analysis_type=analysis_type, **arguments)
     elif match_mode == "blob":
         blob_matching(analysis_type=analysis_type, **arguments)
     else:
@@ -156,42 +140,7 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
     if fill_empty:
         fill_empty_verdicts(df, boolean_column, explanation_column, default)
 
-    # A row the grouping never saw, because its group value is empty, holds no assessment yet.
-    if local_assessment_column:
-        empty = df[local_assessment_column].isnull()
-        df.loc[empty, local_assessment_column] = (f"Not assessed: the row has no '{group_by}' "
-                                                  f"value, so it belongs to no group")
-    if arbiter_assessment_column:
-        empty = df[arbiter_assessment_column].isnull()
-        df.loc[empty, arbiter_assessment_column] = "Not consulted: the group was not analysed"
-
-    assessment_columns = [column for column in (local_assessment_column, arbiter_assessment_column)
-                          if column]
-    if assessment_columns:
-        df = place_columns_after(df, item_description_column, assessment_columns)
-
     return df
-
-
-def place_columns_after(df: pandas.DataFrame, anchor: str, columns: list) -> pandas.DataFrame:
-    """
-    Returns the frame with the given columns moved to sit immediately after the anchor column,
-    in the order given. All named columns must exist.
-
-    Args:
-        df (pandas.DataFrame): The frame to reorder.
-        anchor (str): The column the moved columns should follow.
-        columns (list): The columns to move.
-
-    Returns:
-        pandas.DataFrame: The reordered frame.
-    """
-
-    order = [column for column in df.columns if column not in columns]
-    position = order.index(anchor) + 1
-    for offset, column in enumerate(columns):
-        order.insert(position + offset, column)
-    return df[order]
 
 
 def fill_empty_verdicts(df: pandas.DataFrame, boolean_column: str, explanation_column: str,
@@ -328,7 +277,7 @@ def blob_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         embedding_provider (str): Overrides the embedding provider configured in llm.config.
         embedding_model (str): Overrides the embedding model configured for that provider.
         regenerate (bool): Whether to re-analyse groups that already hold verdicts.
-        modify_number (int): How many groups to analyse before stopping.
+        modify_number (int): How many groups to analyse before stopping, or None for every group.
     """
 
     def map_dict(cell, cluster_results, default=default):
@@ -382,37 +331,17 @@ def blob_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                 cluster_results.append((result, cluster_description_list))
             df.loc[df[group_by] == group_ind, [boolean_column, explanation_column]] = df[df[group_by] == group_ind][item_description_column].apply(lambda desc: pandas.Series(map_dict(desc, cluster_results))).to_numpy()
 
-        if count == modify_number:
-            print(f"Modified {count} datapoints")
+        if modify_number is not None and count == modify_number:
+            print(f"Modified {count} groups, stopping at the modify_number cap. The remaining "
+                  f"groups are NOT analysed and are filled with the analysis default.")
             break
         count += 1
-
-
-def write_assessment(df: pandas.DataFrame, column: str, notes: dict, overwrite: bool = True) -> None:
-    """
-    Writes per row assessment notes into a column, in place. Does nothing when the column is not
-    configured, so callers do not need to guard every write.
-
-    Args:
-        df (pandas.DataFrame): The frame to write into.
-        column (str): The assessment column, or '' when the analysis does not carry one.
-        notes (dict): The note for each row, keyed by index label.
-        overwrite (bool, optional): Whether to replace a value already present. The skip reasons
-            pass False so a verdict kept under regenerate=False keeps its original assessment too.
-    """
-
-    if not column:
-        return
-    for row_index, note in notes.items():
-        if overwrite or pandas.isna(df.at[row_index, column]):
-            df.at[row_index, column] = note
 
 
 def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_description_column: str,
                   boolean_column: str, explanation_column: str, default: str, system_prompt: str,
                   embedding_model_name: str, embedding_provider: str, embedding_model: str,
-                  regenerate: bool, modify_number: int, local_assessment_column: str = "",
-                  arbiter_assessment_column: str = "") -> None:
+                  regenerate: bool, modify_number: int) -> None:
     """
     Clusters each group on how much of one row's line items appear in another's, in place.
 
@@ -434,11 +363,7 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         embedding_provider (str): Overrides the embedding provider configured in llm.config.
         embedding_model (str): Overrides the embedding model configured for that provider.
         regenerate (bool): Whether to re-analyse groups that already hold verdicts.
-        modify_number (int): How many groups to analyse before stopping.
-        local_assessment_column (str, optional): Where to note what the local model concluded per
-            row, or why a row was never assessed. '' leaves the column unwritten.
-        arbiter_assessment_column (str, optional): Where to note the language model's raw ruling
-            per row, or that it was never consulted. '' leaves the column unwritten.
+        modify_number (int): How many groups to analyse before stopping, or None for every group.
 
     Raises:
         ValueError: If the frame's index is not unique, or pair_score is not a known score.
@@ -475,28 +400,17 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
     df_size = len(grouped_df)
 
     # Decide what to work on before embedding anything, so the pass below only pays for line items
-    # that will actually be compared. Groups that are passed over get the reason written into the
-    # assessment column, so a default 'No' in the output can be told apart from an analysed one.
+    # that will actually be compared.
     selected = []
-    skipped = {}
     for group_ind, group_data in grouped_df:
         if not regenerate and (not group_data[boolean_column].isnull().values.any() or not group_data[explanation_column].isnull().values.any()):
             print(f"Not regenerating for {group_by}: {group_ind}/{df_size} as there are exisiting values for all datapoints.")
-            reason = "Not assessed: the group already held a verdict and regenerate is off"
-        elif len(group_data) < 2:
-            reason = "Not assessed: the only PO in its group, nothing to compare against"
-        elif len(selected) == modify_number:
-            reason = f"Not assessed: the run reached its cap of {modify_number} groups before this one"
-        else:
-            selected.append((group_ind, list(group_data.index)))
             continue
-        for row_index in group_data.index:
-            skipped[row_index] = reason
-
-    write_assessment(df, local_assessment_column, skipped, overwrite=False)
-    write_assessment(df, arbiter_assessment_column,
-                     {row_index: "Not consulted: the group was not analysed" for row_index in skipped},
-                     overwrite=False)
+        if len(group_data) < 2:
+            continue  # a group of one row has nothing to be compared against
+        selected.append((group_ind, list(group_data.index)))
+        if modify_number is not None and len(selected) >= modify_number:
+            break
 
     if not selected:
         print("No groups to analyse.")
@@ -524,14 +438,16 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
 
     default_verdict = split_verdict(default, default)
 
+    # Every group in selected is analysed. The cap, when one is set, was already applied while
+    # selecting, so there is nothing left to stop early for.
     for count, (group_ind, row_indices) in enumerate(selected, start=1):
-        print(f"Clustering for {group_by}: {group_ind}/{df_size}")
+        print(f"Clustering for {group_by}: {group_ind} ({count} of {len(selected)} selected, "
+              f"{df_size} in total)")
         size = len(row_indices)
         distances = numpy.zeros((size, size), dtype=float)
         evidence = {}
         category_evidence = {}
         carried_by_line = set()
-        pair_stats = {}
 
         for first in range(size):
             for second in range(first + 1, size):
@@ -540,8 +456,6 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                     vectors, index, weights, line_threshold)
                 score = containment if pair_score == "containment" else jaccard
                 evidence[(first, second)] = pairs
-                best_line = pairs[0][2] if pairs else 0.0
-                category_score = 0.0
                 linked = score >= pair_threshold
                 if linked:
                     carried_by_line.add((first, second))
@@ -563,7 +477,6 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                 # there is nothing left for a distance to say. Complete linkage over this turns the
                 # clustering below into exactly 'every pair inside a cluster is linked'.
                 distances[first][second] = distances[second][first] = 0.0 if linked else 1.0
-                pair_stats[(first, second)] = (score, best_line, category_score, linked)
 
         # Complete linkage, so a cluster forms only when EVERY pair inside it is linked. Average or
         # single linkage would let A join C on the strength of a shared B, and in sets this loosely
@@ -580,47 +493,6 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         for position, label in enumerate(labels):
             clusters.setdefault(label, []).append(position)
         clusters = {label: members for label, members in clusters.items() if len(members) > 1}
-
-        # What the local model concluded for every row of the group, clustered or not, written
-        # before the verdict pass so the columns are complete even when no cluster forms. The
-        # arbiter note for clustered rows is written below, once the model has actually ruled.
-        if local_assessment_column or arbiter_assessment_column:
-            member_of = {position: members for members in clusters.values() for position in members}
-            local_notes, arbiter_notes = {}, {}
-            for position in range(size):
-                stats = [pair_stats[(min(position, other), max(position, other))]
-                         for other in range(size) if other != position]
-                best_score = max(stat[0] for stat in stats)
-                best_line = max(stat[1] for stat in stats)
-                best_category = max(stat[2] for stat in stats)
-                links = sum(1 for stat in stats if stat[3])
-                members = member_of.get(position)
-                if members:
-                    wording = any((min(position, other), max(position, other)) in carried_by_line
-                                  for other in members if other != position)
-                    if wording:
-                        note = (f"Clustered with {len(members) - 1} other PO(s): best line item "
-                                f"similarity {best_line:.2f} (threshold {line_threshold}), "
-                                f"{pair_score} {best_score:.2f} (threshold {pair_threshold})")
-                    else:
-                        note = (f"Clustered with {len(members) - 1} other PO(s) on category alone: "
-                                f"category containment {best_category:.2f} (threshold "
-                                f"{category_threshold}); no line item matched on wording")
-                elif links:
-                    note = (f"Not clustered: linked to {links} PO(s) but not to every member of a "
-                            f"cluster (complete linkage); best {pair_score} {best_score:.2f}")
-                else:
-                    note = (f"Not clustered: best {pair_score} {best_score:.2f} below "
-                            f"{pair_threshold}")
-                    if use_categories:
-                        note += (f", best category containment {best_category:.2f} below "
-                                 f"{category_threshold}")
-                local_notes[row_indices[position]] = note
-                if not members:
-                    arbiter_notes[row_indices[position]] = ("Not consulted: the local model did "
-                                                            "not put this PO in any cluster")
-            write_assessment(df, local_assessment_column, local_notes)
-            write_assessment(df, arbiter_assessment_column, arbiter_notes)
 
         if not clusters:
             print(f"Found 0 clusters for {group_by}: {group_ind}")
@@ -653,20 +525,12 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
             if not result:
                 result = "Error,Something went wrong with the GenAI analysis."
             verdict = split_verdict(result, default)
-            # The ruling is written raw, so the column shows the model's own words even when a
-            # malformed answer makes the verdict columns fall back to the analysis default.
-            write_assessment(df, arbiter_assessment_column,
-                             {row_indices[position]: result for position in members})
             for position in members:
                 verdicts[row_indices[position]] = verdict
 
         for row_index, (value, explanation) in verdicts.items():
             df.at[row_index, boolean_column] = value
             df.at[row_index, explanation_column] = explanation
-
-        if count == modify_number:
-            print(f"Modified {count} datapoints")
-            break
 
 
 def build_user_prompt(descriptions: list, pairs: list, category_pairs: list = None,

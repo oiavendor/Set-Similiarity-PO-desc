@@ -19,8 +19,6 @@ ANALYSIS_DEFAULTS = {
     "category_threshold": "0.60",   # the category containment two POs need to be clustered
     "category_partial_credit": "0.5",  # what a level 1 category agreeing on its own is worth
     "category_batch_size": "20",    # how many line items are categorised per request
-    "local_assessment_column": "",  # where line mode explains what the local model found per row; blank = not written
-    "arbiter_assessment_column": "",  # where line mode records the language model's ruling per row; blank = not written
 }
 
 _analysis_config = None

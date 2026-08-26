@@ -24,7 +24,11 @@ OUTPUT_FILE = r"C:\Users\airts_2026\Desktop\Github-Repo (Vendor)\Set-Similiarity
 
 ANALYSIS_TYPE = "po"
 REGENERATE = True
-MODIFY_NUMBER = 50
+
+# None analyses every group. Setting a number caps the run, and the groups it never reaches are
+# filled with the analysis default, which reads as 'No' in the output without anything having been
+# compared, so only set one for a deliberately partial trial run.
+MODIFY_NUMBER = None
 
 DEBUGMODE = True
 

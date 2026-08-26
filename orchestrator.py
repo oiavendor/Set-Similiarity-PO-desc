@@ -13,7 +13,7 @@ def data_quality_item_cat():
 
 def item_description_match_PO():
     df = ReadSQL("STGOUT_11_SPLITPO_MATCH")
-    df = description_matching(df, "po", regenerate=True, modify_number=50)
+    df = description_matching(df, "po", regenerate=True)
     InsertTable(df, "STGOUT_11_SPLITPO_MATCH")
 
 def item_description_match_payment():
