@@ -1,9 +1,7 @@
-import numpy
 import pandas
 from rapidfuzz import fuzz
 from utils.GenAI import embed, generate_system_prompt, api_query, get_embedding_model_name
-from utils.AnalysisConfig import (get_analysis_option, get_cluster_threshold, get_line_threshold,
-                                  get_pair_threshold)
+from utils.AnalysisConfig import get_analysis_option, get_cluster_threshold, get_line_threshold
 from utils.description_matching_enums import (PO_SET_COLUMN, PO_ITEM_DESC_COLUMN, PO_SPLIT_BOOLEAN_COLUMN,
                                               PO_EXPLANATION_COLUMN, PO_DEFAULT_NON_CLUSTERED,
                                               PAYMENT_SET_COLUMN, PAYMENT_ITEM_DESC_COLUMN,
@@ -20,8 +18,8 @@ from sklearn.cluster import AgglomerativeClustering
 role = "audit associate"
 task = "identify if the list of item descriptions are for"
 
-# How many matched line items are shown to the language model per cluster. They are the evidence
-# for the verdict, but a large cluster produces hundreds of them and burying the prompt costs more
+# How many matched line items are shown to the language model per group. They are the evidence
+# for the verdict, but a large group produces hundreds of them and burying the prompt costs more
 # than it explains. The strongest matches are kept.
 MAX_EVIDENCE_PAIRS = 20
 
@@ -49,16 +47,17 @@ def description_matching(df: pandas.DataFrame, analysis_type: Literal["po", "pay
                          modify_number: int = None, embedding_provider: str = None,
                          embedding_model: str = None, fill_empty: bool = True) -> pandas.DataFrame:
     """
-    Clusters the rows of each group by how alike their item descriptions are, then asks the
-    language model to rule on each cluster it finds.
+    Asks the language model to rule on the item descriptions of each group.
 
     Two matching modes are available, chosen per analysis by match_mode in analysis.config:
 
-        blob  embeds each row's whole description as a single vector. Simple, but when the
-              description is an aggregation of many line items the vector is their centroid, and
-              the items a pair of rows do not share drag the score down.
-        line  splits the description on line_separator and matches the line items directly,
-              aggregating similarity scores rather than vectors. See utils/line_matching.py.
+        blob  clusters the rows of a group by how alike their descriptions are, embedding each
+              whole description as a single vector, and rules on each cluster it finds. Suits a
+              description column holding a single item.
+        line  treats the group itself as the unit and rules on it whole, one verdict written to
+              every row. The line items are matched only to gather the evidence shown to the
+              model. Use this where the grouping already asserts that the rows belong together,
+              as the po analysis does. See line_matching and utils/line_matching.py.
 
     The po analysis also gets a 'Set Similarity' column: each row's best token_set_ratio (0 to
     100) against the other descriptions in its set. It is a plain string measure written
@@ -148,10 +147,10 @@ def fill_empty_verdicts(df: pandas.DataFrame, boolean_column: str, explanation_c
     """
     Fills every row still without a verdict with the analysis default, in place.
 
-    A row is left empty when its group produced no cluster, when it sat in a group that did
-    cluster but did not itself land in one, or when the run stopped at modify_number before
-    reaching its group. Those are all 'nothing found here', so the output workbook carries a
-    verdict on every row rather than a mix of 'No' and blanks.
+    A row is left empty when it is alone in its group, when its group value is empty, when blob
+    mode produced no cluster for it, or when the run stopped at modify_number before reaching its
+    group. Those are all 'nothing found here', so the output workbook carries a verdict on every
+    row rather than a mix of 'No' and blanks.
 
     Note that this does not distinguish 'analysed and cleared' from 'never analysed'. If a run is
     capped by modify_number, the groups it never reached are filled as 'No' too.
@@ -343,30 +342,37 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                   embedding_model_name: str, embedding_provider: str, embedding_model: str,
                   regenerate: bool, modify_number: int) -> None:
     """
-    Clusters each group on how much of one row's line items appear in another's, in place.
+    Rules on each group as a whole, writing one verdict across every row of it, in place.
 
-    Each row's description is split on the configured separator into its line items, every distinct
-    line item across the run is embedded once, and rows are compared by matching their line items
-    one to one rather than by comparing two averaged vectors. See utils/line_matching.py for why
-    that ordering matters.
+    The group is the split. An upstream rule has already decided which purchase orders make up a
+    candidate split, so this does not re-derive that: it puts the whole group to the language model
+    and writes the answer to every row. Two purchase orders in a group are never separated on the
+    grounds that their descriptions read differently, because a purchase divided into complementary
+    parts, a workstation on one order and its processor on another, has descriptions that share
+    nothing by construction. That is the case the analysis most needs to catch.
+
+    The line items are still matched, but only to gather evidence. Each row's description is split
+    on the configured separator, every distinct line item is embedded once, and the pairs that match
+    across the group are shown to the model alongside the descriptions. When nothing matches on
+    wording the prompt asks the complementary question instead. See utils/line_matching.py.
 
     Args:
         df (pandas.DataFrame): The rows to analyse.
-        analysis_type (str): Which analysis is running, used to look up the thresholds.
-        group_by (str): The column rows are grouped by.
+        analysis_type (str): Which analysis is running, used to look up the threshold.
+        group_by (str): The column rows are grouped by; one group is one candidate split.
         item_description_column (str): The column holding the aggregated line item descriptions.
         boolean_column (str): The verdict column to write.
         explanation_column (str): The explanation column to write.
-        default (str): The verdict for a row in a clustered group that did not land in a cluster.
+        default (str): The verdict used when the model's answer cannot be split into two columns.
         system_prompt (str): The instructions handed to the language model.
-        embedding_model_name (str): The embedding model in use, used to look up the thresholds.
+        embedding_model_name (str): The embedding model in use, used to look up the threshold.
         embedding_provider (str): Overrides the embedding provider configured in llm.config.
         embedding_model (str): Overrides the embedding model configured for that provider.
         regenerate (bool): Whether to re-analyse groups that already hold verdicts.
         modify_number (int): How many groups to analyse before stopping, or None for every group.
 
     Raises:
-        ValueError: If the frame's index is not unique, or pair_score is not a known score.
+        ValueError: If the frame's index is not unique.
     """
 
     if not df.index.is_unique:
@@ -374,20 +380,15 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
                          "index. Call df.reset_index(drop=True) before passing it in.")
 
     separator = get_analysis_option(analysis_type, "line_separator")
-    pair_score = get_analysis_option(analysis_type, "pair_score").lower()
-    if pair_score not in ("containment", "jaccard"):
-        raise ValueError(f"Unknown pair_score '{pair_score}' for analysis '{analysis_type}' in "
-                         f"analysis.config. Use 'containment' or 'jaccard'.")
-
     use_categories = get_analysis_option(analysis_type, "use_categories").lower() == "true"
-    category_threshold = float(get_analysis_option(analysis_type, "category_threshold"))
     category_partial_credit = float(get_analysis_option(analysis_type, "category_partial_credit"))
     category_batch_size = int(get_analysis_option(analysis_type, "category_batch_size"))
 
+    # Only the line threshold is read. pair_score, pair_threshold and category_threshold decided
+    # which rows of a group belonged together, and the group already answers that.
     line_threshold = get_line_threshold(analysis_type, embedding_model_name)
-    pair_threshold = get_pair_threshold(analysis_type, embedding_model_name)
     print(f"Embedding with '{embedding_model_name}', matching line items at a cosine similarity of "
-          f"at least {line_threshold}, clustering rows at a {pair_score} of at least {pair_threshold}")
+          f"at least {line_threshold}, one verdict per {group_by}")
 
     # Every row is parsed, not only the rows being analysed, because the line weights are inverse
     # document frequencies over the whole run: how ordinary a line item is cannot be judged from
@@ -423,9 +424,10 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
     print(f"Embedding {len(needed)} distinct line items across {len(selected)} {group_by} groups")
     vectors, index = encode_lines(needed, embedding_provider, embedding_model)
 
-    # What each line item IS, as opposed to how it is worded. Only the rows being analysed are
-    # categorised, because unlike parsing this costs a request, so the category weights are inverse
-    # document frequencies over those rows rather than over the whole frame.
+    # What each line item IS, as opposed to how it is worded. This no longer decides anything: it
+    # names the categories two purchase orders share so the model can be shown them, which is what
+    # a complementary split looks like when the wording has nothing in common. Only the rows being
+    # analysed are categorised, because unlike parsing this costs a request.
     row_categories, category_weights = {}, {}
     if use_categories:
         categories = classify_lines(needed, batch_size=category_batch_size, regenerate=regenerate)
@@ -434,101 +436,54 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
         category_weights = line_weights(list(row_categories.values()))
         placed = sum(1 for value in categories.values() if value[1] != UNCLASSIFIED)
         print(f"Categorised {placed} of {len(categories)} distinct line items, "
-              f"clustering rows at a category containment of at least {category_threshold}")
+              f"shown to the model as evidence")
 
-    default_verdict = split_verdict(default, default)
-
-    # Every group in selected is analysed. The cap, when one is set, was already applied while
-    # selecting, so there is nothing left to stop early for.
+    # One verdict per group. The group IS the candidate split: an upstream rule already decided
+    # these purchase orders belong to one another, so the analysis judges that claim rather than
+    # rebuilding it. Sub-dividing a group by how alike its descriptions read would throw the claim
+    # away, and would answer 'No' for exactly the split being hunted, because a purchase divided
+    # into its complementary parts has descriptions that share nothing by construction.
     for count, (group_ind, row_indices) in enumerate(selected, start=1):
-        print(f"Clustering for {group_by}: {group_ind} ({count} of {len(selected)} selected, "
-              f"{df_size} in total)")
+        print(f"Assessing {group_by}: {group_ind} ({count} of {len(selected)} selected, "
+              f"{df_size} in total, {len(row_indices)} purchase orders)")
         size = len(row_indices)
-        distances = numpy.zeros((size, size), dtype=float)
-        evidence = {}
-        category_evidence = {}
-        carried_by_line = set()
+        pairs, category_pairs = [], []
+        line_carried = False
 
+        # Every pair in the group, compared only to gather what the model is shown. Nothing here
+        # decides membership; membership was decided upstream.
         for first in range(size):
             for second in range(first + 1, size):
-                containment, jaccard, pairs = po_similarity(
+                _, _, matched = po_similarity(
                     row_lines[row_indices[first]], row_lines[row_indices[second]],
                     vectors, index, weights, line_threshold)
-                score = containment if pair_score == "containment" else jaccard
-                evidence[(first, second)] = pairs
-                linked = score >= pair_threshold
-                if linked:
-                    carried_by_line.add((first, second))
+                pairs.extend(matched)
+                line_carried = line_carried or bool(matched)
 
-                # The two scores answer different questions against their own thresholds, so a pair
-                # only has to satisfy one of them. The line score asks whether the same items were
-                # bought twice; the category score asks whether the two POs buy from the same place
-                # in the taxonomy, which is the only way a purchase split into its complementary
-                # parts is visible at all.
                 if use_categories:
-                    category_score, category_pairs = category_similarity(
+                    _, matched_categories = category_similarity(
                         row_categories[row_indices[first]], row_categories[row_indices[second]],
                         category_weights, category_partial_credit)
-                    category_evidence[(first, second)] = category_pairs
-                    linked = linked or category_score >= category_threshold
+                    category_pairs.extend(matched_categories)
 
-                # Recorded as linked or not rather than as a graded distance. Each score has already
-                # been read against its own threshold, and the two are not on a comparable scale, so
-                # there is nothing left for a distance to say. Complete linkage over this turns the
-                # clustering below into exactly 'every pair inside a cluster is linked'.
-                distances[first][second] = distances[second][first] = 0.0 if linked else 1.0
+        pairs = sorted(set(pairs), key=lambda pair: pair[2], reverse=True)[:MAX_EVIDENCE_PAIRS]
+        category_pairs = sorted(set(category_pairs), key=lambda pair: pair[2],
+                                reverse=True)[:MAX_EVIDENCE_PAIRS]
 
-        # Complete linkage, so a cluster forms only when EVERY pair inside it is linked. Average or
-        # single linkage would let A join C on the strength of a shared B, and in sets this loosely
-        # built that chaining would quietly rebuild the set the analysis is meant to take apart.
-        # The threshold sits between the linked distance of 0 and the unlinked distance of 1.
-        labels = AgglomerativeClustering(
-            n_clusters=None,
-            metric='precomputed',
-            linkage='complete',
-            distance_threshold=0.5
-        ).fit(distances).labels_
+        descriptions = [df.at[row_index, item_description_column] for row_index in row_indices]
 
-        clusters = {}
-        for position, label in enumerate(labels):
-            clusters.setdefault(label, []).append(position)
-        clusters = {label: members for label, members in clusters.items() if len(members) > 1}
+        # A group where no line item matched on wording is the complementary case, so the prompt
+        # asks the other question. Asking whether those descriptions look alike would only ever
+        # get one answer, which is how a divided purchase goes unnoticed.
+        print(f"Twin Analysis on {group_by} {group_ind}"
+              f"{'' if line_carried else ' (no wording matched between the descriptions)'}")
+        result = api_query(system_prompt,
+                           build_user_prompt(descriptions, pairs, category_pairs, line_carried))
+        if not result:
+            result = "Error,Something went wrong with the GenAI analysis."
 
-        if not clusters:
-            print(f"Found 0 clusters for {group_by}: {group_ind}")
-            continue
-
-        print(f"Found {len(clusters)} clusters for {group_by}: {group_ind}")
-        verdicts = {row_index: default_verdict for row_index in row_indices}
-
-        for label, members in clusters.items():
-            descriptions = [df.at[row_indices[position], item_description_column] for position in members]
-
-            pairs, category_pairs, line_carried = [], [], False
-            for first in range(len(members)):
-                for second in range(first + 1, len(members)):
-                    key = (members[first], members[second])
-                    pairs.extend(evidence.get(key, []))
-                    category_pairs.extend(category_evidence.get(key, []))
-                    line_carried = line_carried or key in carried_by_line
-            pairs = sorted(set(pairs), key=lambda pair: pair[2], reverse=True)[:MAX_EVIDENCE_PAIRS]
-            category_pairs = sorted(set(category_pairs), key=lambda pair: pair[2],
-                                    reverse=True)[:MAX_EVIDENCE_PAIRS]
-
-            # A cluster no pair of which cleared the line threshold was held together entirely by
-            # what its rows buy, not by how anything is worded. Asking whether those descriptions
-            # look alike would only ever get one answer, so it is asked the other question instead.
-            print(f"Twin Analysis on cluster: {label}"
-                  f"{'' if line_carried else ' (matched on category only)'}")
-            result = api_query(system_prompt,
-                               build_user_prompt(descriptions, pairs, category_pairs, line_carried))
-            if not result:
-                result = "Error,Something went wrong with the GenAI analysis."
-            verdict = split_verdict(result, default)
-            for position in members:
-                verdicts[row_indices[position]] = verdict
-
-        for row_index, (value, explanation) in verdicts.items():
+        value, explanation = split_verdict(result, default)
+        for row_index in row_indices:
             df.at[row_index, boolean_column] = value
             df.at[row_index, explanation_column] = explanation
 
@@ -536,24 +491,23 @@ def line_matching(df: pandas.DataFrame, analysis_type: str, group_by: str, item_
 def build_user_prompt(descriptions: list, pairs: list, category_pairs: list = None,
                       line_carried: bool = True) -> str:
     """
-    Builds the prompt for one cluster, listing the descriptions, the line items that matched
-    between them and the categories they share.
+    Builds the prompt for one group, listing the descriptions, the line items that matched between
+    them and the categories they share.
 
     The first line is kept identical to the one blob mode sends, so the wording the system prompt is
     written against does not shift. The evidence is appended below it, which gives the model
     something specific to rule on and to quote in its explanation rather than several long
     aggregated strings.
 
-    When nothing was matched on wording, the cluster exists only because its rows buy from the same
-    part of the taxonomy, and the question is put the other way round. Asking whether those
+    When nothing matched on wording, the question is put the other way round. Asking whether those
     descriptions resemble each other would get one answer every time, which is exactly how a
     purchase split into its complementary parts goes unnoticed.
 
     Args:
-        descriptions (list): The full descriptions of the rows in the cluster.
+        descriptions (list): The full descriptions of every row in the group.
         pairs (list): The matched line items, as (first, second, similarity), strongest first.
         category_pairs (list, optional): The matched categories, as (first, second, score).
-        line_carried (bool, optional): Whether any pair in the cluster matched on wording. Defaults to True.
+        line_carried (bool, optional): Whether any pair in the group matched on wording. Defaults to True.
 
     Returns:
         str: The prompt.
@@ -574,11 +528,10 @@ def build_user_prompt(descriptions: list, pairs: list, category_pairs: list = No
                    f"levels agree and lower where only the broad category does:\n{matches}")
 
     if not line_carried:
-        prompt += ("\n\nNote that NO line item matched on wording here. These purchase orders were "
-                   "put together only because of what they buy. Judge whether they are the "
-                   "complementary parts of ONE purchase that has been divided between them, for "
-                   "example equipment on one and the components, accessories or installation for "
-                   "that same equipment on another. Answer 'No' if they are simply unrelated "
-                   "purchases that happen to fall in the same category.")
+        prompt += ("\n\nNote that NO line item matched on wording here, so do not look for repeated "
+                   "items. Judge instead whether these are the complementary parts of ONE purchase "
+                   "that has been divided between them, for example equipment on one and the "
+                   "components, accessories or installation for that same equipment on another. "
+                   "Answer 'No' if they are simply unrelated purchases.")
 
     return prompt

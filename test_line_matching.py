@@ -188,24 +188,28 @@ check("both verdict columns exist",
       "Is Split PO" in result.columns and "Explanation" in result.columns)
 check("no blank verdict is left anywhere", result["Is Split PO"].isnull().sum() == 0)
 check("no blank explanation is left anywhere", result["Explanation"].isnull().sum() == 0)
-check("the two matching POs of group 1 are flagged Yes",
-      list(result.loc[[0, 1], "Is Split PO"]) == ["Yes", "Yes"],
-      str(list(result.loc[[0, 1], "Is Split PO"])))
-check("the unrelated PO swept into group 1 is not flagged",
-      result.at[2, "Is Split PO"] == "No", str(result.at[2, "Is Split PO"]))
-check("the unrelated pair in group 2 is not flagged",
-      list(result.loc[[3, 4], "Is Split PO"]) == ["No", "No"],
+# The group IS the split, so every row of a multi-row group carries the model's answer for that
+# group. Nothing is filtered out on the grounds that its wording differs from its neighbours.
+check("every row of group 1 carries the group's verdict",
+      list(result.loc[[0, 1, 2], "Is Split PO"]) == ["Yes", "Yes", "Yes"],
+      str(list(result.loc[[0, 1, 2], "Is Split PO"])))
+check("the unrelated pair in group 2 is ruled on rather than pre-filtered",
+      list(result.loc[[3, 4], "Is Split PO"]) == ["Yes", "Yes"],
       str(list(result.loc[[3, 4], "Is Split PO"])))
 check("the lone PO of group 3 is filled with the default",
       result.at[5, "Is Split PO"] == "No", str(result.at[5, "Is Split PO"]))
+check("one prompt per multi-row group, not one per cluster",
+      len(prompts) == 2, f"{len(prompts)} prompts for 2 multi-row groups")
+check("every PO of a group appears in its prompt",
+      all(description in prompts[0] for description in frame.loc[[0, 1, 2], "Line_desc"]))
 check("the prompt carries the matched line items as evidence",
       any("matched across the descriptions above" in prompt for prompt in prompts))
 check("the prompt still opens with the wording blob mode uses",
       all(prompt.startswith("Item Descriptions: [") for prompt in prompts))
 
-print("\n8. complete linkage refuses to chain A to C through B")
-# A shares a line with B, B shares a different line with C, A and C share nothing. Single or
-# average linkage would put all three in one cluster on the strength of B alone.
+print("\n8. a group is never split up on the strength of its wording")
+# A shares a line with B, B shares a different line with C, A and C share nothing. The old
+# clustering broke this group apart; the group is the split, so all three are ruled on together.
 chain = pandas.DataFrame({
     "Unique_Group_Number": [9, 9, 9],
     "Line_desc": [
@@ -214,10 +218,15 @@ chain = pandas.DataFrame({
         "zeta gadget",
     ],
 })
-dm.api_query = lambda s, u, **kw: "Yes,Item descriptions are similar because they share a reagent."
+chain_prompts = []
+dm.api_query = lambda s, u, **kw: (
+    chain_prompts.append(u),
+    "Yes,Item descriptions are similar because they share a reagent.")[1]
 flagged = list(dm.description_matching(chain, "po", regenerate=True,
                                        embedding_model="all-mpnet-base-v2")["Is Split PO"])
-check("A and C are not clustered together through B", flagged.count("Yes") < 3, str(flagged))
+check("all three POs of the group are ruled on together", flagged == ["Yes"] * 3, str(flagged))
+check("the group was put to the model exactly once", len(chain_prompts) == 1,
+      f"{len(chain_prompts)} prompts")
 
 print("\n9. fill_empty can be turned off")
 sparse = pandas.DataFrame({"Unique_Group_Number": [7],
@@ -310,11 +319,11 @@ ruled = dm.description_matching(complementary, "po", regenerate=True, embedding_
 check("the complementary split is caught despite no shared wording",
       list(ruled.loc[[0, 1], "Is Split PO"]) == ["Yes", "Yes"],
       str(list(ruled.loc[[0, 1], "Is Split PO"])))
-check("a reagent and a workstation are not clustered across categories",
-      ruled.at[2, "Is Split PO"] == "No", str(ruled.at[2, "Is Split PO"]))
-check("the category-only prompt asks the complementary question",
+check("the reagent group reaches the model instead of being cleared on wording",
+      ruled.at[2, "Is Split PO"] == "Yes", str(ruled.at[2, "Is Split PO"]))
+check("the wording-free prompt asks the complementary question",
       any("complementary parts of ONE purchase" in prompt for prompt in prompts))
-check("the category-only prompt says no wording matched",
+check("the wording-free prompt says no wording matched",
       any("NO line item matched on wording" in prompt for prompt in prompts))
 check("the category evidence is shown",
       any("buy from the same categories" in prompt for prompt in prompts))
@@ -323,14 +332,21 @@ if prompts:
     for line in prompts[0].splitlines():
         print(f"        {line[:110]}")
 
-print("\n16. categories can be switched off")
+print("\n16. categories only supply evidence, they no longer decide anything")
 import utils.AnalysisConfig as ac
 _real_option = ac.get_analysis_option
 dm.get_analysis_option = lambda a, o: "false" if o == "use_categories" else _real_option(a, o)
+prompts.clear()
 off = dm.description_matching(complementary.drop(columns=["Is Split PO", "Explanation"]), "po",
                               regenerate=True, embedding_model="all-mpnet-base-v2")
-check("with categories off the complementary split is missed again",
-      off.at[0, "Is Split PO"] == "No", str(off.at[0, "Is Split PO"]))
+# Categories used to be the only thing that could carry a complementary split as far as the model.
+# The group carries it now, so turning them off costs evidence in the prompt, not the finding.
+check("with categories off the complementary split still reaches the model",
+      off.at[0, "Is Split PO"] == "Yes", str(off.at[0, "Is Split PO"]))
+check("with categories off no category evidence is shown",
+      not any("buy from the same categories" in prompt for prompt in prompts))
+check("the complementary question is still asked without categories",
+      any("complementary parts of ONE purchase" in prompt for prompt in prompts))
 dm.get_analysis_option = _real_option
 
 print("\n" + ("ALL CHECKS PASSED" if not failures else f"{len(failures)} FAILURES: {failures}"))
